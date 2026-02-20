@@ -1,0 +1,36 @@
+---
+description: Core Vulkan development standards and architecture principles
+alwaysApply: true
+---
+
+# Vulkan 核心开发规范
+
+## 架构原则
+
+- **职责分离**: Application（窗口/输入）与 Renderer（Vulkan 逻辑）分离，避免单类臃肿
+- **RAII 优先**: 所有 Vulkan 资源（VkBuffer、VkImage、VkPipeline 等）需有明确的创建/销毁配对
+- **初始化顺序**: 严格遵循 Instance → PhysicalDevice → LogicalDevice → Queue → SwapChain → Pipeline 的依赖链
+
+## 资源生命周期
+
+- 创建顺序：先创建被依赖资源，再创建依赖者（如 Framebuffer 依赖 RenderPass、ImageView）
+- 销毁顺序：与创建顺序**相反**，先销毁依赖者
+- SwapChain 重建时：`cleanupSwapChain()` 与 `createSwapChain()` 必须成对，确保无泄漏
+
+## 同步规范
+
+- 使用 `MAX_FRAMES_IN_FLIGHT` 控制并发帧数，避免 CPU 超前 GPU
+- 每帧：`vkAcquireNextImageKHR` → `vkQueueSubmit` → `vkQueuePresentKHR` 必须正确同步
+- 资源更新前：`vkDeviceWaitIdle` 或 fence 等待，避免写入时 GPU 仍在使用
+
+## 错误处理
+
+- 所有 `vkCreate*`、`vkAllocate*` 调用必须检查返回值
+- 使用 `VK_CHECK(result)` 或显式 `if (result != VK_SUCCESS)` 并记录错误
+- Debug 构建启用 `VK_LAYER_KHRONOS_validation`，Release 关闭
+
+## 命名约定
+
+- Vulkan 句柄：保持 `Vk*` 类型原名（如 `VkDevice device`）
+- 成员变量：`camelCase` 或 `m_camelCase`（项目内统一即可）
+- 常量：`UPPER_SNAKE_CASE`（如 `MAX_FRAMES_IN_FLIGHT`）

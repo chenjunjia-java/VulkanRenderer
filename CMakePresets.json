@@ -1,0 +1,45 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "clang-cl-debug",
+      "displayName": "clang-cl Debug (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang-cl-debug",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "C:/PROGRA~1/LLVM/bin/clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "C:/PROGRA~1/LLVM/bin/clang-cl.exe",
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "clang-cl-release",
+      "displayName": "clang-cl Release (Ninja)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/clang-cl-release",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "C:/PROGRA~1/LLVM/bin/clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "C:/PROGRA~1/LLVM/bin/clang-cl.exe",
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "clang-cl-debug",
+      "configurePreset": "clang-cl-debug"
+    },
+    {
+      "name": "clang-cl-release",
+      "configurePreset": "clang-cl-release"
+    }
+  ]
+}
+

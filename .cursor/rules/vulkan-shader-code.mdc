@@ -1,0 +1,47 @@
+---
+description: Vulkan shader (GLSL) conventions
+globs: **/*.vert,**/*.frag,**/*.comp,**/*.glsl
+alwaysApply: false
+---
+
+# Vulkan Shader 规范
+
+## 版本与扩展
+
+```glsl
+// ✅ 必须声明 Vulkan 兼容的 GLSL 版本
+#version 450
+#extension GL_ARB_separate_shader_objects : require
+```
+
+- 使用 `#version 450` 以匹配 Vulkan 的 SPIR-V 1.0/1.1
+- 需要 `GL_ARB_separate_shader_objects` 以支持 `layout(location = N)`
+
+## 布局与绑定
+
+```glsl
+// ✅ 显式 location，与 C++ 端 Vertex 属性一致
+layout(location = 0) in vec3 inPosition;
+layout(location = 1) in vec3 inColor;
+layout(location = 2) in vec2 inTexCoord;
+
+layout(location = 0) out vec4 outColor;
+
+// Descriptor 绑定与 C++ 端 VkDescriptorSetLayout 一致
+layout(binding = 0) uniform UniformBufferObject { ... } ubo;
+layout(binding = 1) uniform sampler2D texSampler;
+```
+
+- `location` 必须与 `VkVertexInputAttributeDescription` 一一对应
+- `binding` 必须与 `VkDescriptorSetLayoutBinding` 一致
+
+## 命名约定
+
+- 输入：`in*`（如 `inPosition`、`inTexCoord`）
+- 输出：`out*`（如 `outColor`、`outFragColor`）
+- Uniform：`ubo`、`uboName` 等
+
+## 编译流程
+
+- 使用 `glslc` 或 `glslangValidator` 编译为 SPIR-V
+- 输出路径与 CMake/构建脚本一致，便于热重载或自动化

@@ -1,0 +1,69 @@
+---
+description: Vulkan C++ code conventions and patterns
+globs: **/*.cpp,**/*.h,**/*.hpp
+alwaysApply: false
+---
+
+# Vulkan C++ 代码规范
+
+## 头文件组织
+
+```cpp
+// ✅ 推荐顺序：系统头 → Vulkan/第三方 → 项目头
+#define GLFW_INCLUDE_VULKAN
+#include <GLFW/glfw3.h>
+#include <vulkan/vulkan_core.h>
+#include <vector>
+#include <optional>
+#include "GlmConfig.h"
+```
+
+- 使用 `#define GLFW_INCLUDE_VULKAN` 或直接 `#include <vulkan/vulkan.h>`，避免重复包含
+- 项目内头文件用 `"` 引用，系统/第三方用 `<>`
+
+## 结构体与对齐
+
+```cpp
+// ✅ Uniform/SSBO 必须显式对齐（std140/std430）
+struct UniformBufferObject {
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
+
+// ✅ Vertex 结构体提供 Vulkan 描述符
+struct Vertex {
+    glm::vec3 pos;
+    glm::vec2 texCoord;
+    static VkVertexInputBindingDescription getBindingDescription();
+    static std::array<VkVertexInputAttributeDescription, N> getAttributeDescriptions();
+};
+```
+
+## 资源封装
+
+- Buffer 创建：`createBuffer()` 统一封装 `vkCreateBuffer` + `vkAllocateMemory` + `vkBindBufferMemory`
+- Image 创建：`createImage()` 统一封装，支持 mipmap、multisample
+- 辅助函数：`findMemoryType`、`findDepthFormat` 等集中管理，避免重复
+
+## 常量与配置
+
+```cpp
+// ✅ 编译期常量放头文件或 constexpr
+const uint32_t WIDTH = 800;
+const uint32_t HEIGHT = 600;
+const int MAX_FRAMES_IN_FLIGHT = 2;
+
+// ✅ 根据构建类型切换 Validation
+#ifdef NDEBUG
+const bool enableValidationLayers = false;
+#else
+const bool enableValidationLayers = true;
+#endif
+```
+
+## 避免的写法
+
+- ❌ 裸指针管理 Vulkan 资源，应使用 RAII 或明确的 init/cleanup 配对
+- ❌ 在头文件中 `#define STB_IMAGE_IMPLEMENTATION`，应在单一 .cpp 中定义
+- ❌ 忽略 `VkResult` 返回值
