@@ -1,6 +1,7 @@
 #include "Resource/model/loaders/ObjModelLoader.h"
 
 // System
+#include <limits>
 #include <unordered_map>
 
 // Project
@@ -28,6 +29,10 @@ bool ObjModelLoader::loadFromFile(const std::string& filePath, Model& outModel)
 
     Mesh mesh{};
     mesh.materialIndex = 0;
+
+    const float inf = std::numeric_limits<float>::infinity();
+    glm::vec3 minPos(inf);
+    glm::vec3 maxPos(-inf);
 
     std::unordered_map<Vertex, uint32_t> uniqueVertices;
     for (const tinyobj::shape_t& shape : shapes) {
@@ -57,6 +62,8 @@ bool ObjModelLoader::loadFromFile(const std::string& filePath, Model& outModel)
                 uniqueVertices.emplace(v, newIndex);
                 mesh.vertices.push_back(v);
                 mesh.indices.push_back(newIndex);
+                minPos = glm::min(minPos, v.pos);
+                maxPos = glm::max(maxPos, v.pos);
             } else {
                 mesh.indices.push_back(it->second);
             }
@@ -66,6 +73,9 @@ bool ObjModelLoader::loadFromFile(const std::string& filePath, Model& outModel)
     if (mesh.vertices.empty() || mesh.indices.empty()) {
         return false;
     }
+
+    mesh.bounds = BoundingBox(minPos, maxPos);
+    mesh.hasBounds = true;
 
     const uint32_t meshIndex = static_cast<uint32_t>(outModel.meshes.size());
     outModel.meshes.push_back(std::move(mesh));

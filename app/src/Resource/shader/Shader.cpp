@@ -1,5 +1,6 @@
 #include "Resource/shader/Shader.h"
 
+#include "Configs/AppConfig.h"
 #include "Resource/core/ResourceManager.h"
 
 #include <fstream>
@@ -73,7 +74,7 @@ bool Shader::doLoad()
         }
     }
 
-    std::string filePath = ASSETS_PATH + "shaders/" + subdir + baseId + extension + ".spv";
+    std::string filePath = AppConfig::ASSETS_PATH + "shaders/" + subdir + baseId + extension + ".spv";
 
     std::vector<char> shaderCode;
     if (!loadShaderCode(filePath, shaderCode)) {

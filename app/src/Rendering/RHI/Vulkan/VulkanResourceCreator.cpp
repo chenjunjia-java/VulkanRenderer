@@ -62,19 +62,21 @@ BufferAllocation VulkanResourceCreator::createBuffer(vk::DeviceSize size, vk::Bu
 }
 
 ImageAllocation VulkanResourceCreator::createImage(uint32_t width, uint32_t height, uint32_t mipLevels, vk::SampleCountFlagBits samples,
-                                                   vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties)
+                                                   vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties,
+                                                   uint32_t arrayLayers, vk::ImageCreateFlags flags)
 {
     vk::ImageCreateInfo imageInfo{};
     imageInfo.imageType = vk::ImageType::e2D;
     imageInfo.extent = vk::Extent3D{width, height, 1};
     imageInfo.mipLevels = mipLevels;
-    imageInfo.arrayLayers = 1;
+    imageInfo.arrayLayers = arrayLayers;
     imageInfo.format = format;
     imageInfo.tiling = tiling;
     imageInfo.initialLayout = vk::ImageLayout::eUndefined;
     imageInfo.usage = usage;
     imageInfo.samples = samples;
     imageInfo.sharingMode = vk::SharingMode::eExclusive;
+    imageInfo.flags = flags;
 
     vk::raii::Image image(*device, imageInfo);
     vk::MemoryRequirements memRequirements = image.getMemoryRequirements();
@@ -89,17 +91,19 @@ ImageAllocation VulkanResourceCreator::createImage(uint32_t width, uint32_t heig
     return {std::move(image), std::move(memory)};
 }
 
-vk::raii::ImageView VulkanResourceCreator::createImageView(vk::Image image, vk::Format format, vk::ImageAspectFlags aspectFlags, uint32_t mipLevels)
+vk::raii::ImageView VulkanResourceCreator::createImageView(vk::Image image, vk::Format format, vk::ImageAspectFlags aspectFlags, uint32_t mipLevels,
+                                                           vk::ImageViewType viewType, uint32_t baseArrayLayer, uint32_t layerCount,
+                                                           uint32_t baseMipLevel, uint32_t mipLevelCount)
 {
     vk::ImageViewCreateInfo viewInfo{};
     viewInfo.image = image;
-    viewInfo.viewType = vk::ImageViewType::e2D;
+    viewInfo.viewType = viewType;
     viewInfo.format = format;
     viewInfo.subresourceRange.aspectMask = aspectFlags;
-    viewInfo.subresourceRange.baseMipLevel = 0;
-    viewInfo.subresourceRange.levelCount = mipLevels;
-    viewInfo.subresourceRange.baseArrayLayer = 0;
-    viewInfo.subresourceRange.layerCount = 1;
+    viewInfo.subresourceRange.baseMipLevel = baseMipLevel;
+    viewInfo.subresourceRange.levelCount = (mipLevelCount > 0) ? mipLevelCount : (mipLevels - baseMipLevel);
+    viewInfo.subresourceRange.baseArrayLayer = baseArrayLayer;
+    viewInfo.subresourceRange.layerCount = layerCount;
 
     return vk::raii::ImageView(*device, viewInfo);
 }
@@ -133,7 +137,14 @@ void VulkanResourceCreator::copyBufferToImage(vk::Buffer buffer, vk::Image image
     });
 }
 
-void VulkanResourceCreator::transitionImageLayout(vk::Image image, vk::Format format, vk::ImageLayout oldLayout, vk::ImageLayout newLayout, uint32_t mipLevels)
+void VulkanResourceCreator::copyBufferToImage(vk::Buffer buffer, vk::Image image, const std::vector<vk::BufferImageCopy>& regions)
+{
+    executeSingleTimeCommands([&](vk::raii::CommandBuffer& cb) {
+        cb.copyBufferToImage(buffer, image, vk::ImageLayout::eTransferDstOptimal, regions);
+    });
+}
+
+void VulkanResourceCreator::transitionImageLayout(vk::Image image, vk::Format format, vk::ImageLayout oldLayout, vk::ImageLayout newLayout, uint32_t mipLevels, uint32_t layerCount)
 {
     executeSingleTimeCommands([&](vk::raii::CommandBuffer& cb) {
         vk::ImageMemoryBarrier barrier{};
@@ -145,7 +156,7 @@ void VulkanResourceCreator::transitionImageLayout(vk::Image image, vk::Format fo
         barrier.subresourceRange.baseMipLevel = 0;
         barrier.subresourceRange.levelCount = mipLevels;
         barrier.subresourceRange.baseArrayLayer = 0;
-        barrier.subresourceRange.layerCount = 1;
+        barrier.subresourceRange.layerCount = layerCount;
 
         vk::PipelineStageFlags sourceStage;
         vk::PipelineStageFlags destinationStage;
@@ -174,6 +185,16 @@ void VulkanResourceCreator::transitionImageLayout(vk::Image image, vk::Format fo
             barrier.dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead | vk::AccessFlagBits::eDepthStencilAttachmentWrite;
             sourceStage = vk::PipelineStageFlagBits::eTopOfPipe;
             destinationStage = vk::PipelineStageFlagBits::eEarlyFragmentTests;
+        } else if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eColorAttachmentOptimal) {
+            barrier.srcAccessMask = {};
+            barrier.dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+            sourceStage = vk::PipelineStageFlagBits::eTopOfPipe;
+            destinationStage = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+        } else if (oldLayout == vk::ImageLayout::eColorAttachmentOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
+            barrier.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+            barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead;
+            sourceStage = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+            destinationStage = vk::PipelineStageFlagBits::eFragmentShader;
         } else {
             throw std::invalid_argument("unsupported layout transition!");
         }

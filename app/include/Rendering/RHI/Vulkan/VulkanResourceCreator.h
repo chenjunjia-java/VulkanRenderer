@@ -26,12 +26,15 @@ public:
 
     BufferAllocation createBuffer(vk::DeviceSize size, vk::BufferUsageFlags usage, vk::MemoryPropertyFlags properties);
     ImageAllocation createImage(uint32_t width, uint32_t height, uint32_t mipLevels, vk::SampleCountFlagBits samples,
-                               vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties);
-    vk::raii::ImageView createImageView(vk::Image image, vk::Format format, vk::ImageAspectFlags aspectFlags, uint32_t mipLevels);
-
+                               vk::Format format, vk::ImageTiling tiling, vk::ImageUsageFlags usage, vk::MemoryPropertyFlags properties,
+                               uint32_t arrayLayers = 1, vk::ImageCreateFlags flags = {});
+    vk::raii::ImageView createImageView(vk::Image image, vk::Format format, vk::ImageAspectFlags aspectFlags, uint32_t mipLevels,
+                                        vk::ImageViewType viewType = vk::ImageViewType::e2D, uint32_t baseArrayLayer = 0, uint32_t layerCount = 1,
+                                        uint32_t baseMipLevel = 0, uint32_t mipLevelCount = 0);
     void copyBuffer(vk::Buffer srcBuffer, vk::Buffer dstBuffer, vk::DeviceSize size);
     void copyBufferToImage(vk::Buffer buffer, vk::Image image, uint32_t width, uint32_t height);
-    void transitionImageLayout(vk::Image image, vk::Format format, vk::ImageLayout oldLayout, vk::ImageLayout newLayout, uint32_t mipLevels);
+    void copyBufferToImage(vk::Buffer buffer, vk::Image image, const std::vector<vk::BufferImageCopy>& regions);
+    void transitionImageLayout(vk::Image image, vk::Format format, vk::ImageLayout oldLayout, vk::ImageLayout newLayout, uint32_t mipLevels, uint32_t layerCount = 1);
     void generateMipmaps(vk::Image image, vk::Format format, uint32_t texWidth, uint32_t texHeight, uint32_t mipLevels);
 
     template<typename Func>
@@ -42,6 +45,8 @@ public:
     const vk::raii::CommandPool& getCommandPool() const { return *commandPool; }
     vk::raii::Device& getDevice() { return *device; }
     const vk::raii::Device& getDevice() const { return *device; }
+    vk::raii::PhysicalDevice& getPhysicalDevice() { return *physicalDevice; }
+    const vk::raii::PhysicalDevice& getPhysicalDevice() const { return *physicalDevice; }
 
 private:
     uint32_t findMemoryType(uint32_t typeFilter, vk::MemoryPropertyFlags properties);
@@ -52,6 +57,7 @@ private:
     vk::raii::PhysicalDevice* physicalDevice = nullptr;
     vk::raii::Queue graphicsQueue{nullptr};
     std::optional<vk::raii::CommandPool> commandPool;
+    std::optional<vk::raii::Fence> singleTimeFence;
 };
 
 template<typename Func>

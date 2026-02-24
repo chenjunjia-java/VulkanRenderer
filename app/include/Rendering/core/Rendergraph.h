@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Rendering/RHI/Vulkan/VulkanTypes.h"
+#include <vulkan/vulkan_raii.hpp>
 #include "Rendering/RHI/Vulkan/VulkanResourceCreator.h"
 #include "Rendering/core/ImageResource.h"
 #include "Rendering/core/RenderPass.h"
@@ -10,6 +10,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+class Camera;
 
 struct ExternalResourceView {
     vk::Image image;
@@ -23,7 +25,8 @@ public:
     void AddResource(const std::string& name, vk::Format format, vk::Extent2D extent,
                      vk::ImageUsageFlags usage, vk::ImageLayout initialLayout,
                      vk::ImageLayout finalLayout, vk::ImageAspectFlags aspectFlags = vk::ImageAspectFlagBits::eColor,
-                     vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
+                     vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
+                     uint32_t extentDivisor = 1);
 
     void AddExternalResource(const std::string& name, vk::Format format, vk::Extent2D extent,
                              vk::ImageLayout initialLayout, vk::ImageLayout finalLayout);
@@ -35,9 +38,13 @@ public:
     void Cleanup();
 
     void Execute(vk::raii::CommandBuffer& commandBuffer, uint32_t imageIndex = 0,
-                 const std::unordered_map<std::string, ExternalResourceView>& externalViews = {});
+                 const glm::mat4& modelMatrix = glm::mat4(1.0f),
+                 const std::unordered_map<std::string, ExternalResourceView>& externalViews = {},
+                 const Camera* camera = nullptr,
+                 RenderStats* stats = nullptr);
 
     vk::ImageView GetImageView(const std::string& name) const;
+    vk::Extent2D GetResourceExtent(const std::string& name) const;
     vk::Extent2D GetExtent() const { return extent; }
     bool IsCompiled() const { return compiled; }
 

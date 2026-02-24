@@ -146,7 +146,7 @@ void VulkanContext::pickPhysicalDevice()
     if (!foundSuitable) {
         throw std::runtime_error(
             "failed to find a suitable GPU with required ray tracing shadow features "
-            "(rayQuery + accelerationStructure + bufferDeviceAddress)!");
+            "(rayQuery + accelerationStructure + bufferDeviceAddress + fragmentStoresAndAtomics)!");
     }
 
     physicalDevice = std::move(physicalDevices[pickIndex]);
@@ -165,8 +165,17 @@ bool VulkanContext::isDeviceSuitable(const vk::raii::PhysicalDevice& dev) const
     }
 
     auto supportedFeatures = dev.getFeatures();
+    // Indirect-driven forward path requires:
+    // - multiDrawIndirect: vkCmdDrawIndexedIndirect with drawCount > 1
+    // - shaderDrawParameters: gl_BaseInstance for firstInstance->drawId mapping (DrawParameters capability)
+    auto features11Chain = dev.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVulkan11Features>();
+    const auto& vulkan11Features = features11Chain.get<vk::PhysicalDeviceVulkan11Features>();
+
     return indices.isComplete() && extensionsSupported && swapChainAdequate
         && supportedFeatures.samplerAnisotropy
+        && supportedFeatures.multiDrawIndirect
+        && supportedFeatures.fragmentStoresAndAtomics
+        && vulkan11Features.shaderDrawParameters
         && hasRequiredRayTracingFeatures(dev);
 }
 
@@ -174,15 +183,18 @@ bool VulkanContext::hasRequiredRayTracingFeatures(const vk::raii::PhysicalDevice
 {
     auto featuresChain = dev.getFeatures2<
         vk::PhysicalDeviceFeatures2,
+        vk::PhysicalDeviceVulkan12Features,
         vk::PhysicalDeviceRayQueryFeaturesKHR,
-        vk::PhysicalDeviceAccelerationStructureFeaturesKHR,
-        vk::PhysicalDeviceBufferDeviceAddressFeatures>();
+        vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
 
+    const auto& vulkan12Features = featuresChain.get<vk::PhysicalDeviceVulkan12Features>();
     const auto& rayQueryFeatures = featuresChain.get<vk::PhysicalDeviceRayQueryFeaturesKHR>();
     const auto& accelFeatures = featuresChain.get<vk::PhysicalDeviceAccelerationStructureFeaturesKHR>();
-    const auto& bdaFeatures = featuresChain.get<vk::PhysicalDeviceBufferDeviceAddressFeatures>();
 
-    return bdaFeatures.bufferDeviceAddress && accelFeatures.accelerationStructure && rayQueryFeatures.rayQuery;
+    return vulkan12Features.bufferDeviceAddress
+        && accelFeatures.accelerationStructure
+        && rayQueryFeatures.rayQuery
+        && vulkan12Features.shaderSampledImageArrayNonUniformIndexing;
 }
 
 QueueFamilyIndices VulkanContext::findQueueFamilies(const vk::raii::PhysicalDevice& dev) const
@@ -250,16 +262,25 @@ void VulkanContext::createLogicalDevice()
         queueCreateInfos.push_back(queueCreateInfo);
     }
 
+    const vk::PhysicalDeviceFeatures supported = physicalDevice->getFeatures();
     vk::PhysicalDeviceFeatures deviceFeatures{};
-    deviceFeatures.samplerAnisotropy = VK_TRUE;
-    deviceFeatures.sampleRateShading = VK_TRUE;
+    deviceFeatures.samplerAnisotropy = supported.samplerAnisotropy ? VK_TRUE : VK_FALSE;
+    deviceFeatures.sampleRateShading = supported.sampleRateShading ? VK_TRUE : VK_FALSE;
+    deviceFeatures.multiDrawIndirect = supported.multiDrawIndirect ? VK_TRUE : VK_FALSE;
+    // Required by RTAO: fragment shader writes to storage image (imageStore).
+    deviceFeatures.fragmentStoresAndAtomics = supported.fragmentStoresAndAtomics ? VK_TRUE : VK_FALSE;
 
-    vk::PhysicalDeviceBufferDeviceAddressFeatures bdaFeatures{};
-    bdaFeatures.bufferDeviceAddress = VK_TRUE;
+    vk::PhysicalDeviceVulkan12Features vulkan12Features{};
+    vulkan12Features.bufferDeviceAddress = VK_TRUE;
+    vulkan12Features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+
+    vk::PhysicalDeviceVulkan11Features vulkan11Features{};
+    vulkan11Features.shaderDrawParameters = VK_TRUE;
+    vulkan11Features.pNext = &vulkan12Features;
 
     vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelFeatures{};
     accelFeatures.accelerationStructure = VK_TRUE;
-    accelFeatures.pNext = &bdaFeatures;
+    accelFeatures.pNext = &vulkan11Features;
 
     vk::PhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
     rayQueryFeatures.rayQuery = VK_TRUE;

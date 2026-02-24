@@ -17,6 +17,7 @@ struct Vertex {
     glm::vec3 normal{0.0f, 1.0f, 0.0f};
     glm::vec3 color{1.0f, 1.0f, 1.0f};
     glm::vec2 texCoord{0.0f, 0.0f};
+    glm::vec4 tangent{0.0f, 0.0f, 0.0f, 0.0f};  // xyz = tangent, w = handedness. Zero = use derivative-based TBN.
 
     static vk::VertexInputBindingDescription getBindingDescription()
     {
@@ -27,9 +28,9 @@ struct Vertex {
         return bindingDescription;
     }
 
-    static std::array<vk::VertexInputAttributeDescription, 4> getAttributeDescriptions()
+    static std::array<vk::VertexInputAttributeDescription, 5> getAttributeDescriptions()
     {
-        std::array<vk::VertexInputAttributeDescription, 4> attributeDescriptions{};
+        std::array<vk::VertexInputAttributeDescription, 5> attributeDescriptions{};
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
         attributeDescriptions[0].format = vk::Format::eR32G32B32Sfloat;
@@ -50,12 +51,17 @@ struct Vertex {
         attributeDescriptions[3].format = vk::Format::eR32G32Sfloat;
         attributeDescriptions[3].offset = offsetof(Vertex, texCoord);
 
+        attributeDescriptions[4].binding = 0;
+        attributeDescriptions[4].location = 4;
+        attributeDescriptions[4].format = vk::Format::eR32G32B32A32Sfloat;
+        attributeDescriptions[4].offset = offsetof(Vertex, tangent);
+
         return attributeDescriptions;
     }
 
     bool operator==(const Vertex& other) const
     {
-        return pos == other.pos && normal == other.normal && color == other.color && texCoord == other.texCoord;
+        return pos == other.pos && normal == other.normal && color == other.color && texCoord == other.texCoord && tangent == other.tangent;
     }
 };
 
@@ -68,7 +74,8 @@ struct hash<Vertex> {
         const size_t normalHash = hash<glm::vec3>()(vertex.normal);
         const size_t colorHash = hash<glm::vec3>()(vertex.color);
         const size_t uvHash = hash<glm::vec2>()(vertex.texCoord);
-        return (((posHash ^ (normalHash << 1)) >> 1) ^ (colorHash << 1)) ^ (uvHash << 2);
+        const size_t tangentHash = hash<glm::vec4>()(vertex.tangent);
+        return ((((posHash ^ (normalHash << 1)) >> 1) ^ (colorHash << 1)) ^ (uvHash << 2)) ^ (tangentHash << 3);
     }
 };
 } // namespace std

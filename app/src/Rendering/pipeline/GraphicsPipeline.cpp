@@ -2,29 +2,55 @@
 
 #include <array>
 
+#include "Configs/AppConfig.h"
+#include "Resource/model/Vertex.h"
+
+namespace {
+uint32_t pipelineVariantIndex(bool enableBlend, bool doubleSided)
+{
+    const uint32_t blendBit = enableBlend ? 1u : 0u;
+    const uint32_t sideBit = doubleSided ? 1u : 0u;
+    // 0..3 mapping described in header.
+    return (blendBit << 1u) | sideBit;
+}
+} // namespace
+
 void GraphicsPipeline::init(VulkanContext& context, SwapChain& swapChain, VulkanResourceCreator& resourceCreator,
-                            Shader& vertShader, Shader& fragShader)
+                            Shader& vertShader, Shader& fragShader, vk::Format targetColorFormat)
 {
     createDescriptorSetLayout(context.getDevice());
-    createGraphicsPipeline(context.getDevice(), swapChain, resourceCreator, context.getMsaaSamples(), vertShader, fragShader);
+    createGraphicsPipeline(context.getDevice(), swapChain, resourceCreator, context.getMsaaSamples(), vertShader, fragShader, targetColorFormat);
 }
 
 void GraphicsPipeline::cleanup()
 {
-    graphicsPipeline.reset();
+    for (auto& p : pipelines) {
+        p.reset();
+    }
     pipelineLayout.reset();
     descriptorSetLayout.reset();
 }
 
 void GraphicsPipeline::recreate(VulkanContext& context, SwapChain& swapChain, VulkanResourceCreator& resourceCreator,
-                                Shader& vertShader, Shader& fragShader)
+                                Shader& vertShader, Shader& fragShader, vk::Format targetColorFormat)
 {
-    graphicsPipeline.reset();
+    for (auto& p : pipelines) {
+        p.reset();
+    }
     pipelineLayout.reset();
     descriptorSetLayout.reset();
 
     createDescriptorSetLayout(context.getDevice());
-    createGraphicsPipeline(context.getDevice(), swapChain, resourceCreator, context.getMsaaSamples(), vertShader, fragShader);
+    createGraphicsPipeline(context.getDevice(), swapChain, resourceCreator, context.getMsaaSamples(), vertShader, fragShader, targetColorFormat);
+}
+
+vk::Pipeline GraphicsPipeline::getPipeline(bool enableBlend, bool doubleSided) const
+{
+    const uint32_t idx = pipelineVariantIndex(enableBlend, doubleSided);
+    if (!pipelines[idx]) {
+        return vk::Pipeline{};
+    }
+    return static_cast<vk::Pipeline>(*pipelines[idx]);
 }
 
 void GraphicsPipeline::createDescriptorSetLayout(vk::raii::Device& device)
@@ -35,32 +61,79 @@ void GraphicsPipeline::createDescriptorSetLayout(vk::raii::Device& device)
     uboLayoutBinding.descriptorCount = 1;
     uboLayoutBinding.stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
 
-    vk::DescriptorSetLayoutBinding samplerLayoutBinding{};
-    samplerLayoutBinding.binding = 1;
-    samplerLayoutBinding.descriptorType = vk::DescriptorType::eCombinedImageSampler;
-    samplerLayoutBinding.descriptorCount = 1;
-    samplerLayoutBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+    auto makeSamplerBinding = [](uint32_t binding) {
+        vk::DescriptorSetLayoutBinding b{};
+        b.binding = binding;
+        b.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+        b.descriptorCount = 1;
+        b.stageFlags = vk::ShaderStageFlagBits::eFragment;
+        return b;
+    };
+
+    vk::DescriptorSetLayoutBinding baseColorBinding = makeSamplerBinding(1);
+    vk::DescriptorSetLayoutBinding metallicRoughnessBinding = makeSamplerBinding(2);
+    vk::DescriptorSetLayoutBinding normalBinding = makeSamplerBinding(3);
+    vk::DescriptorSetLayoutBinding occlusionBinding = makeSamplerBinding(4);
+    vk::DescriptorSetLayoutBinding emissiveBinding = makeSamplerBinding(5);
 
     vk::DescriptorSetLayoutBinding accelerationStructureBinding{};
-    accelerationStructureBinding.binding = 2;
+    accelerationStructureBinding.binding = 6;
     accelerationStructureBinding.descriptorType = vk::DescriptorType::eAccelerationStructureKHR;
     accelerationStructureBinding.descriptorCount = 1;
     accelerationStructureBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
 
-    vk::DescriptorSetLayoutBinding shadowUvBinding{};
-    shadowUvBinding.binding = 3;
-    shadowUvBinding.descriptorType = vk::DescriptorType::eStorageBuffer;
-    shadowUvBinding.descriptorCount = 1;
-    shadowUvBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+    vk::DescriptorSetLayoutBinding instanceLUTBinding{};
+    instanceLUTBinding.binding = 7;
+    instanceLUTBinding.descriptorType = vk::DescriptorType::eStorageBuffer;
+    instanceLUTBinding.descriptorCount = 1;
+    instanceLUTBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
 
-    vk::DescriptorSetLayoutBinding shadowIndexBinding{};
-    shadowIndexBinding.binding = 4;
-    shadowIndexBinding.descriptorType = vk::DescriptorType::eStorageBuffer;
-    shadowIndexBinding.descriptorCount = 1;
-    shadowIndexBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+    vk::DescriptorSetLayoutBinding indexBufferBinding{};
+    indexBufferBinding.binding = 8;
+    indexBufferBinding.descriptorType = vk::DescriptorType::eStorageBuffer;
+    indexBufferBinding.descriptorCount = 1;
+    indexBufferBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
 
-    std::array<vk::DescriptorSetLayoutBinding, 5> bindings = {
-        uboLayoutBinding, samplerLayoutBinding, accelerationStructureBinding, shadowUvBinding, shadowIndexBinding};
+    vk::DescriptorSetLayoutBinding uvBufferBinding{};
+    uvBufferBinding.binding = 9;
+    uvBufferBinding.descriptorType = vk::DescriptorType::eStorageBuffer;
+    uvBufferBinding.descriptorCount = 1;
+    uvBufferBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+    vk::DescriptorSetLayoutBinding baseColorArrayBinding{};
+    baseColorArrayBinding.binding = 10;
+    baseColorArrayBinding.descriptorType = vk::DescriptorType::eCombinedImageSampler;
+    baseColorArrayBinding.descriptorCount = AppConfig::MAX_REFLECTION_MATERIAL_COUNT;
+    baseColorArrayBinding.stageFlags = vk::ShaderStageFlagBits::eFragment;
+
+    vk::DescriptorSetLayoutBinding drawDataBinding{};
+    drawDataBinding.binding = 11;
+    drawDataBinding.descriptorType = vk::DescriptorType::eStorageBuffer;
+    drawDataBinding.descriptorCount = 1;
+    drawDataBinding.stageFlags = vk::ShaderStageFlagBits::eVertex;
+
+    vk::DescriptorSetLayoutBinding irradianceBinding = makeSamplerBinding(12);
+    vk::DescriptorSetLayoutBinding prefilterBinding = makeSamplerBinding(13);
+    vk::DescriptorSetLayoutBinding brdfLutBinding = makeSamplerBinding(14);
+    vk::DescriptorSetLayoutBinding rtaoFullBinding = makeSamplerBinding(15);
+
+    std::array<vk::DescriptorSetLayoutBinding, 16> bindings = {
+        uboLayoutBinding,
+        baseColorBinding,
+        metallicRoughnessBinding,
+        normalBinding,
+        occlusionBinding,
+        emissiveBinding,
+        accelerationStructureBinding,
+        instanceLUTBinding,
+        indexBufferBinding,
+        uvBufferBinding,
+        baseColorArrayBinding,
+        drawDataBinding,
+        irradianceBinding,
+        prefilterBinding,
+        brdfLutBinding,
+        rtaoFullBinding};
 
     vk::DescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -70,9 +143,10 @@ void GraphicsPipeline::createDescriptorSetLayout(vk::raii::Device& device)
 }
 
 void GraphicsPipeline::createGraphicsPipeline(vk::raii::Device& device, SwapChain& swapChain, VulkanResourceCreator& resourceCreator,
-                                             vk::SampleCountFlagBits msaaSamples, Shader& vertShader, Shader& fragShader)
+                                             vk::SampleCountFlagBits msaaSamples, Shader& vertShader, Shader& fragShader,
+                                             vk::Format targetColorFormat)
 {
-    colorFormat = swapChain.getImageFormat();
+    colorFormat = targetColorFormat;
     depthFormat = resourceCreator.findDepthFormat();
 
     vk::PipelineShaderStageCreateInfo vertShaderStageInfo{};
@@ -133,9 +207,16 @@ void GraphicsPipeline::createGraphicsPipeline(vk::raii::Device& device, SwapChai
     rasterizer.depthBiasEnable = VK_FALSE;
 
     vk::PipelineMultisampleStateCreateInfo multisampling{};
-    multisampling.sampleShadingEnable = VK_TRUE;
+    // Important for alpha-masked geometry:
+    // When sample shading is enabled, the fragment shader can run per-sample and interpolants vary per sample.
+    // With alpha-test (discard), this produces per-sample coverage patterns that show up as stippled/white flickering edges after MSAA resolve.
+    // Keep it off to match the depth prepass behavior and stabilize mask edges.
+    multisampling.sampleShadingEnable = VK_FALSE;
     multisampling.rasterizationSamples = msaaSamples;
-    multisampling.minSampleShading = 0.2f;
+    multisampling.minSampleShading = 0.0f;
+    // Keep alpha-to-coverage off by default: it can produce stippled/white dotted edges on foliage.
+    multisampling.alphaToCoverageEnable = VK_FALSE;
+    multisampling.alphaToOneEnable = VK_FALSE;
 
     vk::PipelineColorBlendAttachmentState colorBlendAttachment{};
     colorBlendAttachment.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG
@@ -152,12 +233,20 @@ void GraphicsPipeline::createGraphicsPipeline(vk::raii::Device& device, SwapChai
     vk::DescriptorSetLayout layoutHandle = *descriptorSetLayout;
     pipelineLayoutInfo.pSetLayouts = &layoutHandle;
 
+    vk::PushConstantRange pushRange{};
+    pushRange.stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(PBRPushConstants);
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+
     pipelineLayout = vk::raii::PipelineLayout(device, pipelineLayoutInfo);
 
     vk::PipelineDepthStencilStateCreateInfo depthStencilState{};
     depthStencilState.depthTestEnable = VK_TRUE;
     depthStencilState.depthWriteEnable = VK_TRUE;
-    depthStencilState.depthCompareOp = vk::CompareOp::eLess;
+    // This project uses a depth prepass. Using Less would reject equal-depth fragments in the forward pass.
+    depthStencilState.depthCompareOp = vk::CompareOp::eLessOrEqual;
     depthStencilState.depthBoundsTestEnable = VK_FALSE;
     depthStencilState.stencilTestEnable = VK_FALSE;
 
@@ -182,6 +271,29 @@ void GraphicsPipeline::createGraphicsPipeline(vk::raii::Device& device, SwapChai
     pipelineInfo.renderPass = VK_NULL_HANDLE;
     pipelineInfo.subpass = 0;
 
-    graphicsPipeline = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+    // Create 4 variants (opaque/blend) x (cull/double-sided).
+    for (uint32_t idx = 0; idx < pipelines.size(); ++idx) {
+        const bool enableBlend = (idx & 0b10u) != 0;
+        const bool doubleSided = (idx & 0b01u) != 0;
+
+        rasterizer.cullMode = doubleSided ? vk::CullModeFlagBits::eNone : vk::CullModeFlagBits::eBack;
+
+        if (enableBlend) {
+            colorBlendAttachment.blendEnable = VK_TRUE;
+            // Premultiplied alpha blending: output.rgb is already multiplied by alpha in shader.
+            colorBlendAttachment.srcColorBlendFactor = vk::BlendFactor::eOne;
+            colorBlendAttachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+            colorBlendAttachment.colorBlendOp = vk::BlendOp::eAdd;
+            colorBlendAttachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+            colorBlendAttachment.dstAlphaBlendFactor = vk::BlendFactor::eZero;
+            colorBlendAttachment.alphaBlendOp = vk::BlendOp::eAdd;
+            depthStencilState.depthWriteEnable = VK_FALSE;
+        } else {
+            colorBlendAttachment.blendEnable = VK_FALSE;
+            depthStencilState.depthWriteEnable = VK_TRUE;
+        }
+
+        pipelines[idx] = vk::raii::Pipeline(device, nullptr, pipelineInfo);
+    }
 }
 

@@ -1,4 +1,5 @@
 #include "Engine/Camera/Camera.h"
+#include "Configs/AppConfig.h"
 
 #include <algorithm>
 #include <cmath>
@@ -6,13 +7,13 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 Camera::Camera()
-    : position(0.0f, 0.0f, 3.0f)
+    : position(0.0f, 0.0f, AppConfig::CAMERA_INITIAL_Z)
     , front(0.0f, 0.0f, -1.0f)
     , worldUp(0.0f, 1.0f, 0.0f)
     , yaw(-90.0f)
     , pitch(0.0f)
-    , movementSpeed(2.5f)
-    , mouseSensitivity(0.1f)
+    , movementSpeed(AppConfig::CAMERA_MOVEMENT_SPEED)
+    , mouseSensitivity(AppConfig::CAMERA_MOUSE_SENSITIVITY)
     , zoom(45.0f)
     , lastMouseX(0.0)
     , lastMouseY(0.0)

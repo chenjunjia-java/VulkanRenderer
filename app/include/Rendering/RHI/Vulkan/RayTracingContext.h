@@ -5,15 +5,25 @@
 #include "Rendering/mesh/GpuMesh.h"
 
 #include <optional>
+#include <vector>
+
+struct RayTracingInstanceDesc {
+    uint32_t meshIndex = 0;
+    glm::mat4 transform{1.0f};
+};
 
 class RayTracingContext {
 public:
     RayTracingContext() = default;
 
-    void init(VulkanContext& context, VulkanResourceCreator& resourceCreator, const GpuMesh& mesh,
-              const glm::mat4& modelMatrix);
+    void init(VulkanContext& context,
+              VulkanResourceCreator& resourceCreator,
+              const std::vector<GpuMesh>& meshes,
+              const std::vector<uint8_t>& meshOpaqueFlags,
+              const std::vector<RayTracingInstanceDesc>& instances);
     void cleanup();
-    void updateTopLevelAS(vk::raii::CommandBuffer& commandBuffer, const glm::mat4& modelMatrix);
+    void updateTopLevelAS(vk::raii::CommandBuffer& commandBuffer,
+                          const std::vector<RayTracingInstanceDesc>& instances);
 
     vk::AccelerationStructureKHR getTopLevelAS() const {
         return topLevelAS ? static_cast<vk::AccelerationStructureKHR>(*topLevelAS) : VK_NULL_HANDLE;
@@ -24,19 +34,22 @@ private:
     vk::DeviceAddress getBufferDeviceAddress(vk::Buffer buffer) const;
     vk::DeviceAddress getAccelerationStructureAddress(vk::AccelerationStructureKHR accelerationStructure) const;
     vk::TransformMatrixKHR toVkTransformMatrix(const glm::mat4& matrix) const;
-    void writeInstanceTransform(const glm::mat4& modelMatrix) const;
+    void writeInstances(const std::vector<RayTracingInstanceDesc>& instances) const;
     void recordTopLevelASBuild(vk::raii::CommandBuffer& commandBuffer, vk::BuildAccelerationStructureModeKHR mode);
     void buildOrUpdateTopLevelAS(vk::BuildAccelerationStructureModeKHR mode);
 
-    void buildBottomLevelAS(const GpuMesh& mesh);
-    void buildTopLevelAS();
+    void buildBottomLevelASes(const std::vector<GpuMesh>& meshes, const std::vector<uint8_t>& meshOpaqueFlags);
+    void buildTopLevelAS(uint32_t instanceCount);
 
     VulkanResourceCreator* resourceCreator = nullptr;
     vk::raii::Device* device = nullptr;
 
-    std::optional<vk::raii::AccelerationStructureKHR> bottomLevelAS;
-    std::optional<vk::raii::Buffer> bottomLevelASBuffer;
-    std::optional<vk::raii::DeviceMemory> bottomLevelASMemory;
+    struct BlasEntry {
+        std::optional<vk::raii::AccelerationStructureKHR> as;
+        std::optional<vk::raii::Buffer> buffer;
+        std::optional<vk::raii::DeviceMemory> memory;
+    };
+    std::vector<BlasEntry> bottomLevelASes;
 
     std::optional<vk::raii::AccelerationStructureKHR> topLevelAS;
     std::optional<vk::raii::Buffer> topLevelASBuffer;
@@ -44,6 +57,9 @@ private:
 
     std::optional<vk::raii::Buffer> instanceBuffer;
     std::optional<vk::raii::DeviceMemory> instanceMemory;
+    void* instanceMapped = nullptr;
+    uint32_t instanceCapacity = 0;
+
     std::optional<vk::raii::Buffer> topLevelScratchBuffer;
     std::optional<vk::raii::DeviceMemory> topLevelScratchMemory;
 

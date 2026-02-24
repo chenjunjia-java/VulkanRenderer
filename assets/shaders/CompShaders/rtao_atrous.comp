@@ -1,0 +1,121 @@
+#version 460
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform PBRUniformBufferObject {
+    mat4 model;
+    mat4 view;
+    mat4 proj;
+    vec4 directionalLightDir;
+    vec4 directionalLightColor;
+    vec4 directionalLightParams;
+    vec4 lightPositions[3];
+    vec4 lightColors[3];
+    vec4 camPos;
+    vec4 params;
+    vec4 iblParams;
+    vec4 rtaoParams0;
+    vec4 rtaoParams1;
+    mat4 prevViewProj;
+} ubo;
+
+layout(binding = 1) uniform sampler2D depthResolve;
+layout(binding = 2) uniform sampler2D normalResolve;
+layout(binding = 5) uniform sampler2D aoInitial;
+layout(binding = 6) uniform sampler2D aoPing0;
+layout(binding = 7) uniform sampler2D aoPing1;
+layout(binding = 8, r16f) uniform image2D aoOutPing0;
+layout(binding = 9, r16f) uniform image2D aoOutPing1;
+layout(binding = 17) uniform sampler2D linearDepthResolve;
+
+layout(push_constant) uniform PushParams {
+    uint width;
+    uint height;
+    uint step;
+    uint iteration;
+} pc;
+
+vec3 decodeNormalSafe(vec2 uv)
+{
+    vec3 n = texture(normalResolve, uv).xyz * 2.0 - 1.0;
+    float l2 = dot(n, n);
+    if (any(isnan(n)) || l2 < 1e-6) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    return n * inversesqrt(l2);
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(pc.width) || pix.y >= int(pc.height)) {
+        return;
+    }
+
+    vec2 invSize = 1.0 / vec2(pc.width, pc.height);
+    vec2 uv = (vec2(pix) + 0.5) * invSize;
+    uint iter = pc.iteration;
+    uint dstIdx = iter & 1u;
+    // src: iter0 reads initial; iter1 reads ping0; iter2 reads ping1; ...
+    uint srcIdx = (iter == 0u) ? 2u : ((iter - 1u) & 1u);
+
+    float center = 1.0;
+    if (iter == 0u) {
+        center = texture(aoInitial, uv).r;
+    } else if (srcIdx == 0u) {
+        center = texture(aoPing0, uv).r;
+    } else {
+        center = texture(aoPing1, uv).r;
+    }
+    float centerZ = texture(linearDepthResolve, uv).r;
+    centerZ = max(centerZ, 1e-3);
+    vec3 centerN = decodeNormalSafe(uv);
+
+    float sum = 0.0;
+    float weightSum = 0.0;
+    int step = int(max(pc.step, 1u));
+
+    for (int y = -2; y <= 2; ++y) {
+        for (int x = -2; x <= 2; ++x) {
+            vec2 offset = vec2(x, y) * float(step) * invSize;
+            vec2 tapUv = clamp(uv + offset, vec2(0.0), vec2(1.0));
+            float s = 1.0;
+            if (iter == 0u) {
+                s = texture(aoInitial, tapUv).r;
+            } else if (srcIdx == 0u) {
+                s = texture(aoPing0, tapUv).r;
+            } else {
+                s = texture(aoPing1, tapUv).r;
+            }
+            float spatial = exp(-0.5 * float(x * x + y * y));
+            float range = exp(-abs(s - center) * 8.0);
+            float tapZ = texture(linearDepthResolve, tapUv).r;
+            tapZ = max(tapZ, 1e-3);
+            vec3 tapN = decodeNormalSafe(tapUv);
+
+            // Edge stopping: combine absolute(view-space) + relative depth thresholds.
+            // Using only relative depth causes excessive blurring across small steps at far distance (visible as bright seams / AO leaks).
+            float dz = abs(tapZ - centerZ);
+            float dzRel = dz / max(centerZ, 1e-3);
+            float radius = max(ubo.rtaoParams0.z, 0.01);
+            float sigmaAbs = max(0.01, radius * 0.05);   // meters (>= 1cm)
+            float sigmaRel = 0.0025;                     // 0.25% of view-space depth
+            float depthNorm = max(dz / sigmaAbs, dzRel / sigmaRel);
+            depthNorm *= (1.0 + 0.25 * float(step));     // stricter for wider taps
+            float depthWeight = exp(-depthNorm * depthNorm);
+
+            float normalWeight = pow(clamp(dot(centerN, tapN), 0.0, 1.0), 32.0);
+            float w = spatial * range * depthWeight * normalWeight;
+            sum += s * w;
+            weightSum += w;
+        }
+    }
+
+    float filtered = (weightSum > 0.0) ? (sum / weightSum) : center;
+    if (dstIdx == 0u) {
+        imageStore(aoOutPing0, pix, vec4(filtered, 0.0, 0.0, 0.0));
+    } else {
+        imageStore(aoOutPing1, pix, vec4(filtered, 0.0, 0.0, 0.0));
+    }
+}
+

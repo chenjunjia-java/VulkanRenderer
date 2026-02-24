@@ -4,6 +4,20 @@
 #include <algorithm>
 #include <stdexcept>
 
+namespace {
+
+void waitForValidFramebufferSize(GLFWwindow* window)
+{
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(window, &width, &height);
+    while (width == 0 || height == 0) {
+        glfwWaitEvents();
+        glfwGetFramebufferSize(window, &width, &height);
+    }
+}
+
+}  // namespace
+
 vk::raii::ImageView SwapChain::createImageView(vk::raii::Device& device, vk::Image image, vk::Format format, vk::ImageAspectFlags aspectFlags, uint32_t mipLevels) const
 {
     vk::ImageViewCreateInfo viewInfo{};
@@ -22,12 +36,7 @@ vk::raii::ImageView SwapChain::createImageView(vk::raii::Device& device, vk::Ima
 void SwapChain::init(VulkanContext& context, GLFWwindow* inWindow)
 {
     window = inWindow;
-
-    int width = 0, height = 0;
-    while (width == 0 || height == 0) {
-        glfwGetFramebufferSize(inWindow, &width, &height);
-        glfwWaitEvents();
-    }
+    waitForValidFramebufferSize(inWindow);
 
     createSwapChain(context, window);
     createImageViews(context.getDevice());
@@ -35,11 +44,7 @@ void SwapChain::init(VulkanContext& context, GLFWwindow* inWindow)
 
 void SwapChain::recreate(VulkanContext& context, GLFWwindow* inWindow)
 {
-    int width = 0, height = 0;
-    while (width == 0 || height == 0) {
-        glfwGetFramebufferSize(inWindow, &width, &height);
-        glfwWaitEvents();
-    }
+    waitForValidFramebufferSize(inWindow);
 
     context.getDevice().waitIdle();
     cleanup();
@@ -100,18 +105,20 @@ vk::PresentModeKHR SwapChain::chooseSwapPresentMode(const std::vector<vk::Presen
 
 vk::Extent2D SwapChain::chooseSwapExtent(const vk::SurfaceCapabilitiesKHR& capabilities, GLFWwindow* win) const
 {
-    if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
-        return capabilities.currentExtent;
+    vk::Extent2D actualExtent;
+    if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()
+        && capabilities.currentExtent.width > 0 && capabilities.currentExtent.height > 0) {
+        actualExtent = capabilities.currentExtent;
+    } else {
+        int width, height;
+        glfwGetFramebufferSize(win, &width, &height);
+        actualExtent.width = static_cast<uint32_t>(std::max(1, width));
+        actualExtent.height = static_cast<uint32_t>(std::max(1, height));
     }
-    int width, height;
-    glfwGetFramebufferSize(win, &width, &height);
-
-    vk::Extent2D actualExtent = {
-        static_cast<uint32_t>(width),
-        static_cast<uint32_t>(height)
-    };
     actualExtent.width = std::clamp(actualExtent.width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
     actualExtent.height = std::clamp(actualExtent.height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+    if (actualExtent.width == 0) actualExtent.width = 1;
+    if (actualExtent.height == 0) actualExtent.height = 1;
     return actualExtent;
 }
 

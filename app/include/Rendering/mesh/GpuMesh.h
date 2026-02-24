@@ -8,6 +8,9 @@
 // Vulkan/Third-party
 #include "Rendering/RHI/Vulkan/VulkanResourceCreator.h"
 
+// Project
+#include "Resource/model/Vertex.h"
+
 class GpuMesh {
 public:
     GpuMesh() = default;

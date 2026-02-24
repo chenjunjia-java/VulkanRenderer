@@ -1,5 +1,8 @@
 #include "Rendering/core/Rendergraph.h"
+#include "Configs/AppConfig.h"
 
+#include <algorithm>
+#include <chrono>
 #include <stdexcept>
 
 namespace {
@@ -24,6 +27,18 @@ BarrierParams inferBarrierParams(vk::ImageLayout oldLayout, vk::ImageLayout newL
     }
     if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eDepthStencilAttachmentOptimal) {
         return {vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, vk::AccessFlagBits::eDepthStencilAttachmentRead | vk::AccessFlagBits::eDepthStencilAttachmentWrite};
+    }
+    if (oldLayout == vk::ImageLayout::eColorAttachmentOptimal && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
+        return {vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader,
+                vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead};
+    }
+    if (oldLayout == vk::ImageLayout::eShaderReadOnlyOptimal && newLayout == vk::ImageLayout::eColorAttachmentOptimal) {
+        return {vk::PipelineStageFlagBits::eFragmentShader, vk::PipelineStageFlagBits::eColorAttachmentOutput,
+                vk::AccessFlagBits::eShaderRead, vk::AccessFlagBits::eColorAttachmentWrite};
+    }
+    if (oldLayout == vk::ImageLayout::eUndefined && newLayout == vk::ImageLayout::eShaderReadOnlyOptimal) {
+        return {vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eFragmentShader, {},
+                vk::AccessFlagBits::eShaderRead};
     }
 
     // Fallback: conservative synchronization (kept minimal for now).
@@ -61,25 +76,37 @@ Rendergraph::Rendergraph(vk::raii::Device& dev, VulkanResourceCreator& creator)
 {
 }
 
+namespace {
+vk::Extent2D applyExtentDivisor(vk::Extent2D baseExtent, uint32_t extentDivisor)
+{
+    const uint32_t d = std::max(1u, extentDivisor);
+    return vk::Extent2D{
+        std::max(1u, baseExtent.width / d),
+        std::max(1u, baseExtent.height / d)};
+}
+}  // namespace
+
 void Rendergraph::AddResource(const std::string& name, vk::Format format, vk::Extent2D ext,
                               vk::ImageUsageFlags usage, vk::ImageLayout initialLayout,
                               vk::ImageLayout finalLayout, vk::ImageAspectFlags aspectFlags,
-                              vk::SampleCountFlagBits samples)
+                              vk::SampleCountFlagBits samples, uint32_t extentDivisor)
 {
     if (compiled) {
         throw std::runtime_error("Rendergraph: cannot AddResource after Compile");
     }
     extent = ext;
+    const vk::Extent2D resourceExtent = applyExtentDivisor(ext, extentDivisor);
 
     ImageResource resource;
     resource.name = name;
     resource.format = format;
-    resource.extent = ext;
+    resource.extent = resourceExtent;
     resource.usage = usage;
     resource.initialLayout = initialLayout;
     resource.finalLayout = finalLayout;
     resource.aspectFlags = aspectFlags;
     resource.samples = samples;
+    resource.extentDivisor = std::max(1u, extentDivisor);
     resource.isExternal = false;
     resource.currentLayout = initialLayout;
 
@@ -103,6 +130,7 @@ void Rendergraph::AddExternalResource(const std::string& name, vk::Format format
     resource.finalLayout = finalLayout;
     resource.aspectFlags = vk::ImageAspectFlagBits::eColor;
     resource.samples = vk::SampleCountFlagBits::e1;
+    resource.extentDivisor = 1;
     resource.isExternal = true;
     resource.currentLayout = initialLayout;
 
@@ -179,7 +207,7 @@ void Rendergraph::Recompile(vk::Extent2D newExtent)
 {
     extent = newExtent;
     for (auto& [name, resource] : resources) {
-        resource.extent = newExtent;
+        resource.extent = applyExtentDivisor(newExtent, resource.extentDivisor);
     }
     Cleanup();
     compiled = false;
@@ -222,7 +250,10 @@ void Rendergraph::allocateInternalResources()
 }
 
 void Rendergraph::Execute(vk::raii::CommandBuffer& commandBuffer, uint32_t imageIndex,
-                          const std::unordered_map<std::string, ExternalResourceView>& externalViews)
+                          const glm::mat4& modelMatrix,
+                          const std::unordered_map<std::string, ExternalResourceView>& externalViews,
+                          const Camera* camera,
+                          RenderStats* stats)
 {
     if (!compiled) {
         throw std::runtime_error("Rendergraph: must Compile before Execute");
@@ -260,7 +291,7 @@ void Rendergraph::Execute(vk::raii::CommandBuffer& commandBuffer, uint32_t image
         res.currentLayout = desiredLayout;
     };
 
-    PassExecuteContext ctx{commandBuffer, imageIndex};
+    PassExecuteContext ctx{commandBuffer, imageIndex, modelMatrix, camera, stats};
     for (auto passIdx : executionOrder) {
         // Pre-pass: transition inputs/outputs to the layouts required for the pass.
         // Current minimal policy:
@@ -271,21 +302,38 @@ void Rendergraph::Execute(vk::raii::CommandBuffer& commandBuffer, uint32_t image
         for (const auto& input : pass.getInputs()) {
             auto rit = resources.find(input);
             if (rit != resources.end()) {
-                ensureResourceLayout(input, rit->second.finalLayout);
+                const vk::ImageLayout inputLayout = pass.getRequiredInputLayout(input).value_or(rit->second.finalLayout);
+                ensureResourceLayout(input, inputLayout);
             }
         }
         for (const auto& output : pass.getOutputs()) {
             auto rit = resources.find(output);
             if (rit == resources.end()) continue;
             const ImageResource& res = rit->second;
+            const vk::ImageLayout outputLayout = pass.getRequiredOutputLayout(output).value_or(res.finalLayout);
             if (res.isExternal && res.finalLayout == vk::ImageLayout::ePresentSrcKHR) {
                 ensureResourceLayout(output, vk::ImageLayout::eColorAttachmentOptimal);
             } else {
-                ensureResourceLayout(output, res.finalLayout);
+                ensureResourceLayout(output, outputLayout);
             }
         }
 
+        const auto tPass0 = std::chrono::high_resolution_clock::now();
         passes[passIdx]->execute(ctx);
+        const auto tPass1 = std::chrono::high_resolution_clock::now();
+        if (AppConfig::ENABLE_PERF_DEBUG && stats) {
+            const double passMs = std::chrono::duration<double, std::milli>(tPass1 - tPass0).count();
+            const std::string& name = pass.getName();
+            if (name == "DepthPrepass") stats->depthPrepassMs = passMs;
+            else if (name == "RtaoComputePass") stats->rtaoMs = passMs;
+            else if (name == "SkyboxPass") stats->skyboxMs = passMs;
+            else if (name == "ScenePass") stats->forwardMs = passMs;
+            else if (name == "BloomExtractPass") stats->bloomExtractMs = passMs;
+            else if (name == "BloomBlurPassH") stats->bloomBlurHMs = passMs;
+            else if (name == "BloomBlurPassV") stats->bloomBlurVMs = passMs;
+            else if (name == "TonemapBloomPass") stats->tonemapMs = passMs;
+            else if (name == "OcclusionPass") stats->occlusionMs = passMs;
+        }
 
         // Post-pass: bring external presentable outputs back to their declared finalLayout.
         for (const auto& output : pass.getOutputs()) {
@@ -306,5 +354,14 @@ vk::ImageView Rendergraph::GetImageView(const std::string& name) const
         return vk::ImageView{};
     }
     return static_cast<vk::ImageView>(*it->second.view);
+}
+
+vk::Extent2D Rendergraph::GetResourceExtent(const std::string& name) const
+{
+    auto it = resources.find(name);
+    if (it == resources.end()) {
+        return extent;
+    }
+    return it->second.extent;
 }
 

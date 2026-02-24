@@ -29,21 +29,46 @@ add_executable(VulkanLearning
     app/src/Resource/model/Model.cpp
     app/src/Resource/model/loaders/GltfModelLoader.cpp
     app/src/Resource/model/loaders/ObjModelLoader.cpp
+    app/src/Resource/texture/HdrTextureLoader.cpp
+    app/src/Resource/texture/KtxTextureLoader.cpp
     app/src/Resource/texture/Texture.cpp
     app/src/Resource/shader/Shader.cpp
     app/src/Rendering/pipeline/GraphicsPipeline.cpp
+    app/src/Rendering/pipeline/DepthPrepassPipeline.cpp
+    app/src/Rendering/pipeline/RtaoComputePipeline.cpp
+    app/src/Rendering/pipeline/PostProcessPipeline.cpp
     app/src/Rendering/core/FrameManager.cpp
     app/src/Rendering/core/Rendergraph.cpp
+    app/src/Rendering/animation/AnimationPlayer.cpp
     app/src/Rendering/renderer/Renderer.cpp
     app/src/Rendering/core/RenderPass.cpp
     app/src/Rendering/core/RenderTarget.cpp
+    app/src/Rendering/pass/DepthPrepass.cpp
     app/src/Rendering/pass/ForwardPass.cpp
+    app/src/Rendering/pass/BloomExtractPass.cpp
+    app/src/Rendering/pass/BloomBlurPass.cpp
+    app/src/Rendering/pass/RtaoComputePass.cpp
+    app/src/Rendering/pass/TonemapBloomPass.cpp
     app/src/Rendering/mesh/GpuMesh.cpp
+    app/src/Rendering/mesh/GlobalMeshBuffer.cpp
+    app/src/Rendering/ibl/EquirectToCubemap.cpp
+    app/src/Rendering/ibl/IblPrecompute.cpp
+    app/src/Rendering/pipeline/SkyboxPipeline.cpp
+    app/src/Rendering/pass/SkyboxPass.cpp
+    app/src/ImGuiIntegration/ImGuiContext.cpp
 )
+
+# Run from project root so assets/ and assets/models/ resolve correctly
+set_property(TARGET VulkanLearning PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
 
 target_include_directories(VulkanLearning PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/app/include
 )
+
+if (MSVC)
+    # Ensure UTF-8 source parsing (prevents CP936 multibyte issues with Chinese comments/strings).
+    target_compile_options(VulkanLearning PRIVATE /utf-8)
+endif()
 
 # ---- tinygltf (header-only) ----
 FetchContent_Declare(
@@ -76,9 +101,30 @@ if (WIN32)
         "${_VULKAN_SDK}/Third-Parties"
     )
 
+    # ImGui (bundled with Vulkan SDK)
+    set(_IMGUI_DIR "${_VULKAN_SDK}/Third-Parties/imgui")
+    target_sources(VulkanLearning PRIVATE
+        "${_IMGUI_DIR}/imgui.cpp"
+        "${_IMGUI_DIR}/imgui_draw.cpp"
+        "${_IMGUI_DIR}/imgui_tables.cpp"
+        "${_IMGUI_DIR}/imgui_widgets.cpp"
+        "${_IMGUI_DIR}/imgui_demo.cpp"
+        "${_IMGUI_DIR}/backends/imgui_impl_glfw.cpp"
+        "${_IMGUI_DIR}/backends/imgui_impl_vulkan.cpp"
+    )
+    target_include_directories(VulkanLearning PRIVATE
+        "${_IMGUI_DIR}"
+        "${_IMGUI_DIR}/backends"
+    )
+
     # KTX-Software (bundled with Vulkan SDK)
     target_include_directories(VulkanLearning PRIVATE
         "${_VULKAN_SDK}/Third-Parties/KTX-Software/include"
+    )
+    find_library(KTX_LIBRARY
+        NAMES ktx
+        HINTS "${_VULKAN_SDK}/Third-Parties/KTX-Software/lib"
+        REQUIRED
     )
 
     find_path(GLFW_INCLUDE_DIR
@@ -100,7 +146,55 @@ if (WIN32)
     )
 
     target_link_libraries(VulkanLearning PRIVATE GLFW::GLFW)
+    target_link_libraries(VulkanLearning PRIVATE "${KTX_LIBRARY}")
 else()
     message(FATAL_ERROR "This CMake setup currently targets Windows (WIN32) only.")
+endif()
+
+# ---- Shaders (compile to SPIR-V) ----
+find_program(GLSLC_EXECUTABLE glslc)
+if (GLSLC_EXECUTABLE)
+    set(SHADER_SOURCES
+        assets/shaders/VertShaders/pbr.vert
+        assets/shaders/FragShaders/pbr.frag
+        assets/shaders/VertShaders/depth_prepass.vert
+        assets/shaders/FragShaders/depth_only.frag
+        assets/shaders/VertShaders/occlusion_bounds.vert
+        assets/shaders/VertShaders/cubemap_capture.vert
+        assets/shaders/FragShaders/equirect_to_cubemap.frag
+        assets/shaders/VertShaders/skybox.vert
+        assets/shaders/FragShaders/skybox.frag
+        assets/shaders/FragShaders/irradiance_convolution.frag
+        assets/shaders/VertShaders/prefilter_capture.vert
+        assets/shaders/FragShaders/prefilter.frag
+        assets/shaders/VertShaders/brdf_quad.vert
+        assets/shaders/VertShaders/fullscreen.vert
+        assets/shaders/FragShaders/brdf_integrate.frag
+        assets/shaders/FragShaders/bloom_extract.frag
+        assets/shaders/FragShaders/bloom_blur.frag
+        assets/shaders/FragShaders/tonemap_bloom.frag
+        assets/shaders/CompShaders/rtao_trace_half.comp
+        assets/shaders/CompShaders/rtao_atrous.comp
+        assets/shaders/CompShaders/rtao_upsample.comp
+    )
+
+    set(SHADER_SPV)
+    foreach(SHADER IN LISTS SHADER_SOURCES)
+        set(SRC "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}")
+        set(SPV "${CMAKE_CURRENT_SOURCE_DIR}/${SHADER}.spv")
+        add_custom_command(
+            OUTPUT "${SPV}"
+            COMMAND "${GLSLC_EXECUTABLE}" --target-env=vulkan1.2 "${SRC}" -o "${SPV}"
+            DEPENDS "${SRC}"
+            COMMENT "Compiling shader ${SHADER}"
+            VERBATIM
+        )
+        list(APPEND SHADER_SPV "${SPV}")
+    endforeach()
+
+    add_custom_target(Shaders DEPENDS ${SHADER_SPV})
+    add_dependencies(VulkanLearning Shaders)
+else()
+    message(WARNING "glslc not found; shaders must be precompiled into assets/shaders/*.spv")
 endif()
 

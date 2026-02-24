@@ -14,6 +14,7 @@ struct ImageResource {
     vk::ImageLayout finalLayout;
     vk::ImageAspectFlags aspectFlags;
     vk::SampleCountFlagBits samples;
+    uint32_t extentDivisor = 1;
     bool isExternal = false;
 
     // Tracked by Rendergraph for barrier insertion.

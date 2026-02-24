@@ -43,19 +43,31 @@ vk::TransformMatrixKHR RayTracingContext::toVkTransformMatrix(const glm::mat4& m
     return transform;
 }
 
-void RayTracingContext::writeInstanceTransform(const glm::mat4& modelMatrix) const
+void RayTracingContext::writeInstances(const std::vector<RayTracingInstanceDesc>& instances) const
 {
-    vk::AccelerationStructureInstanceKHR instance{};
-    instance.transform = toVkTransformMatrix(modelMatrix);
-    instance.instanceCustomIndex = 0;
-    instance.mask = 0xFF;
-    instance.instanceShaderBindingTableRecordOffset = 0;
-    instance.flags = static_cast<uint8_t>(vk::GeometryInstanceFlagBitsKHR::eTriangleFacingCullDisable);
-    instance.accelerationStructureReference = getAccelerationStructureAddress(*bottomLevelAS);
+    if (!instanceMapped || !instanceMemory || !instanceBuffer) {
+        throw std::runtime_error("instance buffer is not initialized/mapped");
+    }
+    if (instances.size() != static_cast<size_t>(instanceCapacity)) {
+        throw std::runtime_error("instance count mismatch: RayTracingContext must be re-initialized");
+    }
 
-    void* mapped = instanceMemory->mapMemory(0, sizeof(vk::AccelerationStructureInstanceKHR));
-    std::memcpy(mapped, &instance, sizeof(vk::AccelerationStructureInstanceKHR));
-    instanceMemory->unmapMemory();
+    auto* out = reinterpret_cast<vk::AccelerationStructureInstanceKHR*>(instanceMapped);
+    for (uint32_t i = 0; i < instanceCapacity; ++i) {
+        const RayTracingInstanceDesc& src = instances[i];
+        if (src.meshIndex >= bottomLevelASes.size() || !bottomLevelASes[src.meshIndex].as) {
+            throw std::runtime_error("invalid meshIndex for ray tracing instance");
+        }
+
+        vk::AccelerationStructureInstanceKHR inst{};
+        inst.transform = toVkTransformMatrix(src.transform);
+        inst.instanceCustomIndex = src.meshIndex;
+        inst.mask = 0xFF;
+        inst.instanceShaderBindingTableRecordOffset = 0;
+        inst.flags = static_cast<uint8_t>(vk::GeometryInstanceFlagBitsKHR::eTriangleFacingCullDisable);
+        inst.accelerationStructureReference = getAccelerationStructureAddress(*bottomLevelASes[src.meshIndex].as);
+        out[i] = inst;
+    }
 }
 
 void RayTracingContext::recordTopLevelASBuild(vk::raii::CommandBuffer& commandBuffer,
@@ -86,7 +98,7 @@ void RayTracingContext::recordTopLevelASBuild(vk::raii::CommandBuffer& commandBu
     buildInfo.scratchData.deviceAddress = getBufferDeviceAddress(*topLevelScratchBuffer);
 
     vk::AccelerationStructureBuildRangeInfoKHR rangeInfo{};
-    rangeInfo.primitiveCount = 1;
+    rangeInfo.primitiveCount = instanceCapacity;
     rangeInfo.primitiveOffset = 0;
     rangeInfo.firstVertex = 0;
     rangeInfo.transformOffset = 0;
@@ -109,20 +121,29 @@ void RayTracingContext::buildOrUpdateTopLevelAS(vk::BuildAccelerationStructureMo
     });
 }
 
-void RayTracingContext::init(VulkanContext& context, VulkanResourceCreator& inResourceCreator, const GpuMesh& mesh,
-                             const glm::mat4& modelMatrix)
+void RayTracingContext::init(VulkanContext& context,
+                             VulkanResourceCreator& inResourceCreator,
+                             const std::vector<GpuMesh>& meshes,
+                             const std::vector<uint8_t>& meshOpaqueFlags,
+                             const std::vector<RayTracingInstanceDesc>& instances)
 {
     resourceCreator = &inResourceCreator;
     device = &context.getDevice();
 
-    buildBottomLevelAS(mesh);
-    buildTopLevelAS();
-    writeInstanceTransform(modelMatrix);
-    buildOrUpdateTopLevelAS(vk::BuildAccelerationStructureModeKHR::eUpdate);
+    buildBottomLevelASes(meshes, meshOpaqueFlags);
+    buildTopLevelAS(static_cast<uint32_t>(instances.size()));
+    writeInstances(instances);
+    buildOrUpdateTopLevelAS(vk::BuildAccelerationStructureModeKHR::eBuild);
 }
 
 void RayTracingContext::cleanup()
 {
+    if (instanceMemory && instanceMapped) {
+        instanceMemory->unmapMemory();
+    }
+    instanceMapped = nullptr;
+    instanceCapacity = 0;
+
     instanceBuffer.reset();
     instanceMemory.reset();
     topLevelScratchBuffer.reset();
@@ -132,9 +153,7 @@ void RayTracingContext::cleanup()
     topLevelASBuffer.reset();
     topLevelASMemory.reset();
 
-    bottomLevelAS.reset();
-    bottomLevelASBuffer.reset();
-    bottomLevelASMemory.reset();
+    bottomLevelASes.clear();
 
     resourceCreator = nullptr;
     device = nullptr;
@@ -143,27 +162,22 @@ void RayTracingContext::cleanup()
     topLevelUpdateScratchSize = 0;
 }
 
-void RayTracingContext::updateTopLevelAS(vk::raii::CommandBuffer& commandBuffer, const glm::mat4& modelMatrix)
+void RayTracingContext::updateTopLevelAS(vk::raii::CommandBuffer& commandBuffer,
+                                         const std::vector<RayTracingInstanceDesc>& instances)
 {
-    if (!topLevelAS || !instanceBuffer || !instanceMemory || !bottomLevelAS || !topLevelScratchBuffer) {
+    if (!topLevelAS || !instanceBuffer || !instanceMemory || !topLevelScratchBuffer) {
         throw std::runtime_error("cannot update TLAS before ray tracing structures are initialized");
     }
-    writeInstanceTransform(modelMatrix);
-
-    vk::MemoryBarrier preBarrier{};
-    preBarrier.srcAccessMask = vk::AccessFlagBits::eAccelerationStructureWriteKHR
-        | vk::AccessFlagBits::eTransferWrite
-        | vk::AccessFlagBits::eShaderRead;
-    preBarrier.dstAccessMask = vk::AccessFlagBits::eAccelerationStructureReadKHR
-        | vk::AccessFlagBits::eAccelerationStructureWriteKHR;
+    writeInstances(instances);
 
     commandBuffer.pipelineBarrier(
-        vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR
-        | vk::PipelineStageFlagBits::eTransfer
-        | vk::PipelineStageFlagBits::eFragmentShader,
+        vk::PipelineStageFlagBits::eHost,
         vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR,
         {},
-        preBarrier,
+        vk::MemoryBarrier{
+            vk::AccessFlagBits::eHostWrite,
+            vk::AccessFlagBits::eAccelerationStructureReadKHR
+        },
         {},
         {});
 
@@ -175,85 +189,108 @@ void RayTracingContext::updateTopLevelAS(vk::raii::CommandBuffer& commandBuffer,
 
     commandBuffer.pipelineBarrier(
         vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR,
-        vk::PipelineStageFlagBits::eAccelerationStructureBuildKHR | vk::PipelineStageFlagBits::eFragmentShader,
+        vk::PipelineStageFlagBits::eFragmentShader,
         {},
         postBarrier,
         {},
         {});
 }
 
-void RayTracingContext::buildBottomLevelAS(const GpuMesh& mesh)
+void RayTracingContext::buildBottomLevelASes(const std::vector<GpuMesh>& meshes, const std::vector<uint8_t>& meshOpaqueFlags)
 {
-    vk::DeviceAddress vertexAddress = getBufferDeviceAddress(mesh.getVertexBuffer());
-    vk::DeviceAddress indexAddress = getBufferDeviceAddress(mesh.getIndexBuffer());
+    bottomLevelASes.clear();
+    bottomLevelASes.resize(meshes.size());
 
-    vk::AccelerationStructureGeometryTrianglesDataKHR triangles{};
-    triangles.vertexFormat = vk::Format::eR32G32B32Sfloat;
-    triangles.vertexData.deviceAddress = vertexAddress;
-    triangles.vertexStride = sizeof(Vertex);
-    triangles.maxVertex = mesh.getVertexCount();
-    triangles.indexType = vk::IndexType::eUint32;
-    triangles.indexData.deviceAddress = indexAddress;
+    for (size_t i = 0; i < meshes.size(); ++i) {
+        const GpuMesh& mesh = meshes[i];
+        if (!mesh.isUploaded() || mesh.getVertexCount() == 0 || mesh.getIndexCount() == 0) {
+            continue;
+        }
 
-    vk::AccelerationStructureGeometryKHR geometry{};
-    geometry.geometryType = vk::GeometryTypeKHR::eTriangles;
-    geometry.flags = {};
-    geometry.geometry.triangles = triangles;
+        vk::DeviceAddress vertexAddress = getBufferDeviceAddress(mesh.getVertexBuffer());
+        vk::DeviceAddress indexAddress = getBufferDeviceAddress(mesh.getIndexBuffer());
 
-    const uint32_t primitiveCount = mesh.getIndexCount() / 3;
+        vk::AccelerationStructureGeometryTrianglesDataKHR triangles{};
+        triangles.vertexFormat = vk::Format::eR32G32B32Sfloat;
+        triangles.vertexData.deviceAddress = vertexAddress;
+        triangles.vertexStride = sizeof(Vertex);
+        triangles.maxVertex = mesh.getVertexCount() > 0 ? (mesh.getVertexCount() - 1) : 0;
+        triangles.indexType = vk::IndexType::eUint32;
+        triangles.indexData.deviceAddress = indexAddress;
 
-    vk::AccelerationStructureBuildGeometryInfoKHR buildInfo{};
-    buildInfo.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
-    buildInfo.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
-    buildInfo.mode = vk::BuildAccelerationStructureModeKHR::eBuild;
-    buildInfo.geometryCount = 1;
-    buildInfo.pGeometries = &geometry;
+        vk::AccelerationStructureGeometryKHR geometry{};
+        geometry.geometryType = vk::GeometryTypeKHR::eTriangles;
+        // Per-mesh opaque policy:
+        // - true  => mark geometry opaque for faster traversal
+        // - false => allow candidate traversal + alpha test in ray query
+        const bool isOpaque = (i < meshOpaqueFlags.size()) ? (meshOpaqueFlags[i] != 0u) : true;
+        geometry.flags = isOpaque ? vk::GeometryFlagBitsKHR::eOpaque : vk::GeometryFlagsKHR{};
+        geometry.geometry.triangles = triangles;
 
-    vk::AccelerationStructureBuildSizesInfoKHR buildSizeInfo{};
-    buildSizeInfo = device->getAccelerationStructureBuildSizesKHR(
-        vk::AccelerationStructureBuildTypeKHR::eDevice, buildInfo, primitiveCount);
+        const uint32_t primitiveCount = mesh.getIndexCount() / 3;
+        if (primitiveCount == 0) {
+            continue;
+        }
 
-    BufferAllocation asStorage = createDeviceAddressBuffer(
-        buildSizeInfo.accelerationStructureSize,
-        vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR,
-        vk::MemoryPropertyFlagBits::eDeviceLocal);
-    bottomLevelASBuffer = std::move(asStorage.buffer);
-    bottomLevelASMemory = std::move(asStorage.memory);
+        vk::AccelerationStructureBuildGeometryInfoKHR buildInfo{};
+        buildInfo.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+        buildInfo.flags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+        buildInfo.mode = vk::BuildAccelerationStructureModeKHR::eBuild;
+        buildInfo.geometryCount = 1;
+        buildInfo.pGeometries = &geometry;
 
-    vk::AccelerationStructureCreateInfoKHR createInfo{};
-    createInfo.buffer = *bottomLevelASBuffer;
-    createInfo.size = buildSizeInfo.accelerationStructureSize;
-    createInfo.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
-    bottomLevelAS = vk::raii::AccelerationStructureKHR(*device, createInfo);
+        vk::AccelerationStructureBuildSizesInfoKHR buildSizeInfo{};
+        buildSizeInfo = device->getAccelerationStructureBuildSizesKHR(
+            vk::AccelerationStructureBuildTypeKHR::eDevice, buildInfo, primitiveCount);
 
-    BufferAllocation scratch = createDeviceAddressBuffer(
-        buildSizeInfo.buildScratchSize,
-        vk::BufferUsageFlagBits::eStorageBuffer,
-        vk::MemoryPropertyFlagBits::eDeviceLocal);
+        BufferAllocation asStorage = createDeviceAddressBuffer(
+            buildSizeInfo.accelerationStructureSize,
+            vk::BufferUsageFlagBits::eAccelerationStructureStorageKHR,
+            vk::MemoryPropertyFlagBits::eDeviceLocal);
+        bottomLevelASes[i].buffer = std::move(asStorage.buffer);
+        bottomLevelASes[i].memory = std::move(asStorage.memory);
 
-    buildInfo.dstAccelerationStructure = *bottomLevelAS;
-    buildInfo.scratchData.deviceAddress = getBufferDeviceAddress(*scratch.buffer);
+        vk::AccelerationStructureCreateInfoKHR createInfo{};
+        createInfo.buffer = *bottomLevelASes[i].buffer;
+        createInfo.size = buildSizeInfo.accelerationStructureSize;
+        createInfo.type = vk::AccelerationStructureTypeKHR::eBottomLevel;
+        bottomLevelASes[i].as = vk::raii::AccelerationStructureKHR(*device, createInfo);
 
-    vk::AccelerationStructureBuildRangeInfoKHR rangeInfo{};
-    rangeInfo.primitiveCount = primitiveCount;
-    rangeInfo.primitiveOffset = 0;
-    rangeInfo.firstVertex = 0;
-    rangeInfo.transformOffset = 0;
+        BufferAllocation scratch = createDeviceAddressBuffer(
+            buildSizeInfo.buildScratchSize,
+            vk::BufferUsageFlagBits::eStorageBuffer,
+            vk::MemoryPropertyFlagBits::eDeviceLocal);
 
-    std::array<const vk::AccelerationStructureBuildRangeInfoKHR*, 1> rangeInfos = {&rangeInfo};
-    resourceCreator->executeSingleTimeCommands([&](vk::raii::CommandBuffer& cb) {
-        cb.buildAccelerationStructuresKHR(buildInfo, rangeInfos);
-    });
+        buildInfo.dstAccelerationStructure = *bottomLevelASes[i].as;
+        buildInfo.scratchData.deviceAddress = getBufferDeviceAddress(*scratch.buffer);
+
+        vk::AccelerationStructureBuildRangeInfoKHR rangeInfo{};
+        rangeInfo.primitiveCount = primitiveCount;
+        rangeInfo.primitiveOffset = 0;
+        rangeInfo.firstVertex = 0;
+        rangeInfo.transformOffset = 0;
+
+        std::array<const vk::AccelerationStructureBuildRangeInfoKHR*, 1> rangeInfos = {&rangeInfo};
+        resourceCreator->executeSingleTimeCommands([&](vk::raii::CommandBuffer& cb) {
+            cb.buildAccelerationStructuresKHR(buildInfo, rangeInfos);
+        });
+    }
 }
 
-void RayTracingContext::buildTopLevelAS()
+void RayTracingContext::buildTopLevelAS(uint32_t instanceCount)
 {
+    if (instanceCount == 0) {
+        throw std::runtime_error("cannot build TLAS with zero instances");
+    }
+
+    instanceCapacity = instanceCount;
     BufferAllocation instAlloc = createDeviceAddressBuffer(
-        sizeof(vk::AccelerationStructureInstanceKHR),
+        sizeof(vk::AccelerationStructureInstanceKHR) * static_cast<vk::DeviceSize>(instanceCount),
         vk::BufferUsageFlagBits::eAccelerationStructureBuildInputReadOnlyKHR,
         vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     instanceBuffer = std::move(instAlloc.buffer);
     instanceMemory = std::move(instAlloc.memory);
+    instanceMapped = instanceMemory->mapMemory(0, VK_WHOLE_SIZE);
 
     vk::AccelerationStructureGeometryInstancesDataKHR instancesData{};
     instancesData.arrayOfPointers = VK_FALSE;
@@ -263,7 +300,7 @@ void RayTracingContext::buildTopLevelAS()
     geometry.geometryType = vk::GeometryTypeKHR::eInstances;
     geometry.geometry.instances = instancesData;
 
-    constexpr uint32_t primitiveCount = 1;
+    const uint32_t primitiveCount = instanceCount;
 
     topLevelBuildFlags = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace
         | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
@@ -301,9 +338,6 @@ void RayTracingContext::buildTopLevelAS()
         vk::MemoryPropertyFlagBits::eDeviceLocal);
     topLevelScratchBuffer = std::move(scratchAlloc.buffer);
     topLevelScratchMemory = std::move(scratchAlloc.memory);
-
-    writeInstanceTransform(glm::mat4(1.0f));
-    buildOrUpdateTopLevelAS(vk::BuildAccelerationStructureModeKHR::eBuild);
 
     if (!topLevelAS) {
         throw std::runtime_error("failed to build top-level acceleration structure");

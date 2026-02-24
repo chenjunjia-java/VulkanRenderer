@@ -1,10 +1,10 @@
 #include "Resource/texture/Texture.h"
 
+#include "Configs/AppConfig.h"
 #include "Resource/core/ResourceManager.h"
 
 #include <cmath>
 #include <cstring>
-#include <stdexcept>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
@@ -58,8 +58,9 @@ void Texture::createVulkanImage(unsigned char* data, int width, int height, int 
     samplerInfo.addressModeU = vk::SamplerAddressMode::eRepeat;
     samplerInfo.addressModeV = vk::SamplerAddressMode::eRepeat;
     samplerInfo.addressModeW = vk::SamplerAddressMode::eRepeat;
-    samplerInfo.anisotropyEnable = VK_TRUE;
-    samplerInfo.maxAnisotropy = 16.0f;
+    const auto feats = resourceCreator->getPhysicalDevice().getFeatures();
+    samplerInfo.anisotropyEnable = feats.samplerAnisotropy ? VK_TRUE : VK_FALSE;
+    samplerInfo.maxAnisotropy = feats.samplerAnisotropy ? 16.0f : 1.0f;
     samplerInfo.borderColor = vk::BorderColor::eIntOpaqueBlack;
     samplerInfo.unnormalizedCoordinates = VK_FALSE;
     samplerInfo.compareEnable = VK_FALSE;
@@ -67,14 +68,14 @@ void Texture::createVulkanImage(unsigned char* data, int width, int height, int 
     samplerInfo.mipmapMode = vk::SamplerMipmapMode::eLinear;
     samplerInfo.mipLodBias = 0.0f;
     samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+    samplerInfo.maxLod = (mipLevels > 0) ? static_cast<float>(mipLevels - 1) : 0.0f;
 
     textureSampler = vk::raii::Sampler(device, samplerInfo);
 }
 
 bool Texture::doLoad()
 {
-    std::string filePath = ASSETS_PATH + "textures/" + GetId() + ".png";
+    std::string filePath = AppConfig::ASSETS_PATH + "textures/" + GetId() + ".png";
 
     unsigned char* data = loadImageData(filePath, &textureWidth, &textureHeight, &textureChannels);
     if (!data) {

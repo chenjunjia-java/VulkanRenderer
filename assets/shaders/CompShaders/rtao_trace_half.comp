@@ -1,0 +1,473 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(binding = 0) uniform PBRUniformBufferObject {
+    mat4 model;
+    mat4 view;
+    mat4 proj;
+    vec4 directionalLightDir;
+    vec4 directionalLightColor;
+    vec4 directionalLightParams;
+    vec4 lightPositions[3];
+    vec4 lightColors[3];
+    vec4 camPos;
+    vec4 params;
+    vec4 iblParams;
+    vec4 rtaoParams0;
+    vec4 rtaoParams1;
+    mat4 prevViewProj;
+} ubo;
+
+layout(binding = 1) uniform sampler2D depthResolve;
+layout(binding = 2) uniform sampler2D normalResolve;
+layout(binding = 3) uniform sampler2D rtaoHistoryPrev;
+layout(binding = 4, r16f) uniform image2D rtaoHistoryCurrOut;
+layout(binding = 17) uniform sampler2D linearDepthResolve;
+layout(binding = 11) uniform accelerationStructureEXT topLevelAS;
+
+// Alpha-test support (MASK materials) for rayQuery candidate intersections.
+// Reuses the same reflection buffers/textures bound in C++.
+layout(std430, binding = 12) readonly buffer InstanceLUTBuffer {
+    // x = materialID, y = indexBufferOffset (in indices[])
+    uvec2 entries[];
+} instanceLUT;
+layout(std430, binding = 13) readonly buffer IndexBuffer {
+    uint indices[];
+} indexBuffer;
+layout(std430, binding = 14) readonly buffer UvBuffer {
+    vec2 uvs[];
+} uvBuffer;
+const int MAX_REFLECTION_MATERIAL_COUNT = 256;
+layout(binding = 15) uniform sampler2D baseColorArray[MAX_REFLECTION_MATERIAL_COUNT];
+layout(std430, binding = 16) readonly buffer MaterialParamsBuffer {
+    // x = alphaCutoff, y = alphaMode(0=Opaque,1=Mask,2=Blend)
+    vec4 params[];
+} materialParams;
+
+layout(push_constant) uniform PushParams {
+    uint width;
+    uint height;
+    uint step;
+    uint iteration;
+} pc;
+
+const float PI = 3.14159265359;
+const float PI2 = 6.28318530718;
+const float ORIGIN_EPS = 1.0 / 32.0;
+const float FLOAT_SCALE = 1.0 / 65536.0;
+const float INT_SCALE = 256.0;
+
+float hash11(float x)
+{
+    return fract(sin(x) * 43758.5453123);
+}
+
+float radicalInverseVdC(uint bits)
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10;
+}
+
+vec2 hammersley(uint i, uint n)
+{
+    return vec2(float(i) / max(float(n), 1.0), radicalInverseVdC(i));
+}
+
+mat3 buildTbn(vec3 n)
+{
+    vec3 up = (abs(n.y) < 0.999) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 t = normalize(cross(up, n));
+    vec3 b = cross(n, t);
+    return mat3(t, b, n);
+}
+
+vec3 reconstructViewPosFromLinearZ(mat4 invProj, vec2 uv, float linearViewZ)
+{
+    // Reconstruct a view-space ray at far plane, then scale by linear view-space Z.
+    vec4 farClip = vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+    vec4 farView = invProj * farClip;
+    vec3 dir = normalize(farView.xyz / max(farView.w, 1e-6));
+    float t = linearViewZ / max(-dir.z, 1e-6);
+    return dir * t;
+}
+
+vec3 decodeNormal(vec2 uv)
+{
+    vec3 enc = texture(normalResolve, uv).xyz;
+    vec3 n = normalize(enc * 2.0 - 1.0);
+    if (n.x != n.x || n.y != n.y || n.z != n.z || dot(n, n) < 0.25) {
+        return vec3(0.0, 1.0, 0.0);
+    }
+    return n;
+}
+
+vec3 offsetRay(vec3 p, vec3 n)
+{
+    ivec3 ofi = ivec3(n * INT_SCALE);
+    vec3 pi = vec3(
+        intBitsToFloat(floatBitsToInt(p.x) + ((p.x < 0.0) ? -ofi.x : ofi.x)),
+        intBitsToFloat(floatBitsToInt(p.y) + ((p.y < 0.0) ? -ofi.y : ofi.y)),
+        intBitsToFloat(floatBitsToInt(p.z) + ((p.z < 0.0) ? -ofi.z : ofi.z)));
+    return vec3(
+        (abs(p.x) < ORIGIN_EPS) ? (p.x + FLOAT_SCALE * n.x) : pi.x,
+        (abs(p.y) < ORIGIN_EPS) ? (p.y + FLOAT_SCALE * n.y) : pi.y,
+        (abs(p.z) < ORIGIN_EPS) ? (p.z + FLOAT_SCALE * n.z) : pi.z);
+}
+
+bool queryAoClosestHit(vec3 origin, vec3 dir, float tMin, float tMax, out float tHit)
+{
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(
+        rq,
+        topLevelAS,
+        // IMPORTANT: do NOT force Opaque here.
+        // We need candidate intersections so MASK geometry can be alpha-tested; otherwise fences/leaves become solid occluders.
+        // Do NOT cull backfaces for AO; otherwise corners/thin geometry can leak and show bright seams.
+        gl_RayFlagsTerminateOnFirstHitEXT,
+        0xFF,
+        origin,
+        tMin,
+        dir,
+        tMax);
+
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) {
+            uint meshIndex = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+            uvec2 lut = instanceLUT.entries[meshIndex];
+            uint materialID = lut.x;
+            uint indexOffset = lut.y;
+
+            vec4 mp = materialParams.params[materialID];
+            float alphaCutoff = mp.x;
+            float alphaMode = mp.y;
+
+            // Opaque: always confirm (early-out with TerminateOnFirstHit).
+            if (alphaMode < 0.5) {
+                rayQueryConfirmIntersectionEXT(rq);
+                continue;
+            }
+            // Blend: treat as non-occluding for AO.
+            if (alphaMode > 1.5) {
+                continue;
+            }
+
+            // Mask: alpha-test using baseColor alpha at hit UV.
+            uint prim = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+            vec2 bary = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+            float w0 = 1.0 - bary.x - bary.y;
+            uint i0 = indexBuffer.indices[indexOffset + prim * 3u + 0u];
+            uint i1 = indexBuffer.indices[indexOffset + prim * 3u + 1u];
+            uint i2 = indexBuffer.indices[indexOffset + prim * 3u + 2u];
+            vec2 uv = uvBuffer.uvs[i0] * w0 + uvBuffer.uvs[i1] * bary.x + uvBuffer.uvs[i2] * bary.y;
+            float a = texture(baseColorArray[nonuniformEXT(int(materialID))], uv).a;
+            if (a >= alphaCutoff) {
+                rayQueryConfirmIntersectionEXT(rq);
+            }
+        }
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        tHit = tMax;
+        return false;
+    }
+    tHit = rayQueryGetIntersectionTEXT(rq, true);
+    return true;
+}
+
+float traceAoRay(vec3 origin, vec3 dir, float tMin, float tMax)
+{
+    float t = tMax;
+    if (!queryAoClosestHit(origin, dir, tMin, tMax, t)) {
+        return 1.0;
+    }
+
+    // Extremely close hits are often self-intersections. Retry once from a slightly advanced origin
+    // instead of treating them as fully unoccluded, which can create bright leaks in tight contacts.
+    if (t <= tMin * 1.5) {
+        float retryAdvance = max(tMin * 2.0, 2e-4);
+        float retryT = tMax;
+        if (!queryAoClosestHit(origin + dir * retryAdvance, dir, max(tMin, 1e-4), tMax, retryT)) {
+            return 1.0;
+        }
+        t = retryT + retryAdvance;
+    }
+
+    // Distance-weighted visibility:
+    // - Very close hits are likely self-intersection -> ignore.
+    // - Far hits contribute little occlusion -> keep visibility high.
+    if (t <= tMin * 1.5) {
+        return 1.0;
+    }
+    // Normalize distance inside [tMin..tMax] then apply a contrast curve.
+    // Larger exponent => stronger near-field occlusion (darker crevices) without bringing back random black blobs.
+    float x = clamp((t - tMin) / max(tMax - tMin, 1e-3), 0.0, 1.0);
+    const float OCCLUSION_EXP = 3.0;
+    return pow(x, OCCLUSION_EXP);
+}
+
+bool computePrevUv(vec3 worldPos, out vec2 prevUv)
+{
+    vec4 prevClip = ubo.prevViewProj * vec4(worldPos, 1.0);
+    if (prevClip.w <= 1e-5) {
+        prevUv = vec2(0.0);
+        return false;
+    }
+    vec3 prevNdc = prevClip.xyz / prevClip.w;
+    prevUv = prevNdc.xy * 0.5 + 0.5;
+    if (any(lessThan(prevUv, vec2(0.0))) || any(greaterThan(prevUv, vec2(1.0)))) {
+        return false;
+    }
+    return true;
+}
+
+void main()
+{
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= int(pc.width) || pix.y >= int(pc.height)) {
+        return;
+    }
+
+    vec2 uv = (vec2(pix) + 0.5) / vec2(pc.width, pc.height);
+    uv = clamp(uv, vec2(0.0), vec2(1.0));
+    float linearViewZ = texture(linearDepthResolve, uv).r;
+    if (linearViewZ <= 1e-6) {
+        imageStore(rtaoHistoryCurrOut, pix, vec4(1.0));
+        return;
+    }
+
+    mat4 invProj = inverse(ubo.proj);
+    mat4 invView = inverse(ubo.view);
+    vec3 viewPos = reconstructViewPosFromLinearZ(invProj, uv, linearViewZ);
+    float viewZ = linearViewZ;
+    vec3 worldPos = (invView * vec4(viewPos, 1.0)).xyz;
+    uint debugMode = uint(ubo.iblParams.w + 0.5);
+
+    int rayCount = clamp(int(ubo.rtaoParams0.y + 0.5), 1, 16);
+    float baseRadius = max(ubo.rtaoParams0.z, 0.01);
+    float baseBias = max(ubo.rtaoParams0.w, 0.0005);
+
+    // Estimate pixel footprint in view-space to stabilize bias/radius across distance.
+    vec2 texelFull = 1.0 / vec2(textureSize(linearDepthResolve, 0));
+    // Pick a "same-surface" neighbor from ±x/±y to avoid crossing depth discontinuities.
+    // This greatly stabilizes footprint/geomNormal at seams (especially at far distance where relative depth tests weaken).
+    float discontinuityAbsZ = max(0.02, baseRadius * 0.25);
+    const float DISCONTINUITY_REL_Z = 0.015;
+
+    vec2 uvXp = uv + vec2(texelFull.x, 0.0);
+    vec2 uvXm = uv - vec2(texelFull.x, 0.0);
+    vec2 uvYp = uv + vec2(0.0, texelFull.y);
+    vec2 uvYm = uv - vec2(0.0, texelFull.y);
+
+    float depthXp = texture(linearDepthResolve, uvXp).r;
+    float depthXm = texture(linearDepthResolve, uvXm).r;
+    float depthYp = texture(linearDepthResolve, uvYp).r;
+    float depthYm = texture(linearDepthResolve, uvYm).r;
+    depthXp = (depthXp <= 1e-6) ? linearViewZ : depthXp;
+    depthXm = (depthXm <= 1e-6) ? linearViewZ : depthXm;
+    depthYp = (depthYp <= 1e-6) ? linearViewZ : depthYp;
+    depthYm = (depthYm <= 1e-6) ? linearViewZ : depthYm;
+
+    vec3 viewPosXp = reconstructViewPosFromLinearZ(invProj, uvXp, depthXp);
+    vec3 viewPosXm = reconstructViewPosFromLinearZ(invProj, uvXm, depthXm);
+    vec3 viewPosYp = reconstructViewPosFromLinearZ(invProj, uvYp, depthYp);
+    vec3 viewPosYm = reconstructViewPosFromLinearZ(invProj, uvYm, depthYm);
+
+    float zXp = -viewPosXp.z;
+    float zXm = -viewPosXm.z;
+    float zYp = -viewPosYp.z;
+    float zYm = -viewPosYm.z;
+
+    float dXp = abs(zXp - viewZ);
+    float dXm = abs(zXm - viewZ);
+    float dYp = abs(zYp - viewZ);
+    float dYm = abs(zYm - viewZ);
+
+    float rXp = dXp / max(viewZ, 1e-3);
+    float rXm = dXm / max(viewZ, 1e-3);
+    float rYp = dYp / max(viewZ, 1e-3);
+    float rYm = dYm / max(viewZ, 1e-3);
+
+    bool okXp = (rXp <= DISCONTINUITY_REL_Z) && (dXp <= discontinuityAbsZ);
+    bool okXm = (rXm <= DISCONTINUITY_REL_Z) && (dXm <= discontinuityAbsZ);
+    bool okYp = (rYp <= DISCONTINUITY_REL_Z) && (dYp <= discontinuityAbsZ);
+    bool okYm = (rYm <= DISCONTINUITY_REL_Z) && (dYm <= discontinuityAbsZ);
+
+    vec3 viewPosX = viewPos;
+    vec3 viewPosY = viewPos;
+    if (okXp && okXm) {
+        viewPosX = (dXp <= dXm) ? viewPosXp : viewPosXm;
+    } else if (okXp) {
+        viewPosX = viewPosXp;
+    } else if (okXm) {
+        viewPosX = viewPosXm;
+    }
+    if (okYp && okYm) {
+        viewPosY = (dYp <= dYm) ? viewPosYp : viewPosYm;
+    } else if (okYp) {
+        viewPosY = viewPosYp;
+    } else if (okYm) {
+        viewPosY = viewPosYm;
+    }
+
+    vec3 viewDx = viewPosX - viewPos;
+    vec3 viewDy = viewPosY - viewPos;
+    float footprint = max(length(viewDx), length(viewDy));
+
+    // Use a depth-derived geometric normal for the AO hemisphere.
+    // Pick the best neighbor pair among 4 combinations to avoid crossing depth discontinuities (small props / steps),
+    // which can produce a wildly wrong normal and make AO go fully black (looks like self-intersection).
+    vec3 bestViewN = vec3(0.0);
+    float bestScore = 1e30;
+    if (okXp && okYp) {
+        vec3 n = cross(viewPosYp - viewPos, viewPosXp - viewPos);
+        float s = dXp + dYp;
+        float n2 = dot(n, n);
+        if (n2 > 1e-14 && s < bestScore) { bestScore = s; bestViewN = n * inversesqrt(n2); }
+    }
+    if (okXp && okYm) {
+        vec3 n = cross(viewPosXp - viewPos, viewPosYm - viewPos);
+        float s = dXp + dYm;
+        float n2 = dot(n, n);
+        if (n2 > 1e-14 && s < bestScore) { bestScore = s; bestViewN = n * inversesqrt(n2); }
+    }
+    if (okXm && okYp) {
+        vec3 n = cross(viewPosYp - viewPos, viewPosXm - viewPos);
+        float s = dXm + dYp;
+        float n2 = dot(n, n);
+        if (n2 > 1e-14 && s < bestScore) { bestScore = s; bestViewN = n * inversesqrt(n2); }
+    }
+    if (okXm && okYm) {
+        vec3 n = cross(viewPosXm - viewPos, viewPosYm - viewPos);
+        float s = dXm + dYm;
+        float n2 = dot(n, n);
+        if (n2 > 1e-14 && s < bestScore) { bestScore = s; bestViewN = n * inversesqrt(n2); }
+    }
+
+    vec3 geomNormal = vec3(0.0, 1.0, 0.0);
+    if (bestScore < 1e29) {
+        geomNormal = normalize(mat3(invView) * bestViewN);
+    } else {
+        // Last resort: avoid using potentially "artist" normals (e.g. radial normals on disks) for AO hemisphere.
+        geomNormal = vec3(0.0, 1.0, 0.0);
+    }
+    if (dot(geomNormal, ubo.camPos.xyz - worldPos) < 0.0) {
+        geomNormal = -geomNormal;
+    }
+
+    // Bias: prevent self-intersection (especially visible as black speckles/blotches).
+    float biasFromFootprint = footprint * 0.05;
+    // Keep bias bounded; too-large bias (and thus large tMin) causes AO leaks/bright seams at contact edges.
+    float biasMax = max(baseBias, min(baseRadius * 0.02, 0.03));
+    float bias = clamp(max(baseBias, biasFromFootprint), baseBias, biasMax);
+
+    // Radius: mild footprint-based scaling (avoid exploding radius at far distance).
+    float radiusScale = clamp(sqrt(max(footprint, 1e-4) / 0.03), 1.0, 1.6);
+    float radius = baseRadius * radiusScale;
+
+    // Keep origin offset at floating-point ULP scale to avoid light leaks through narrow gaps.
+    vec3 origin = offsetRay(worldPos, geomNormal);
+    mat3 tbn = buildTbn(geomNormal);
+    float tMin = max(1e-4, bias * 0.25);
+
+    // Debug outputs (view in PBR with DEBUG_VIEW_MODE >= 9):
+    // 10: bias visualization, 11: footprint visualization, 12: current (no temporal).
+    if (debugMode == 10u) {
+        float v = clamp(bias / 0.05, 0.0, 1.0);
+        imageStore(rtaoHistoryCurrOut, pix, vec4(v, 0.0, 0.0, 0.0));
+        return;
+    }
+    if (debugMode == 11u) {
+        float v = clamp(footprint / 0.05, 0.0, 1.0);
+        imageStore(rtaoHistoryCurrOut, pix, vec4(v, 0.0, 0.0, 0.0));
+        return;
+    }
+
+    // IMPORTANT:
+    // With very low rayCount (1-2), per-frame rotating the sampling pattern makes the AO look like it's "spinning"
+    // because the temporal accumulator often rejects history due to high noise. Keep the pattern stable per-pixel.
+    float frameTerm = (rayCount >= 4) ? (ubo.rtaoParams1.w * 131.0) : 0.0;
+    float seedBase = dot(vec2(pix), vec2(1.0, 57.0)) + frameTerm;
+    float angle = hash11(seedBase) * PI2;
+    float cs = cos(angle);
+    float sn = sin(angle);
+    mat2 rot = mat2(cs, -sn, sn, cs);
+
+    float visibility = 0.0;
+    for (int i = 0; i < rayCount; ++i) {
+        vec2 xi = hammersley(uint(i), uint(rayCount));
+        xi = rot * (xi - 0.5) + 0.5;
+        xi = clamp(xi, vec2(0.0), vec2(1.0));
+
+        float phi = PI2 * xi.x;
+        float cosTheta = sqrt(1.0 - xi.y);
+        float sinTheta = sqrt(xi.y);
+        vec3 localDir = vec3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+        vec3 rayDir = normalize(tbn * localDir);
+
+        // Grazing-angle ray origin offset:
+        // Normal-only bias can still self-intersect for near-tangent rays due to precision and triangle thickness.
+        // Add a tiny, adaptive offset along the ray direction to suppress self-hits without increasing global bias
+        // (which would otherwise cause bright seams / AO leaks at contact edges).
+        float nd = clamp(dot(geomNormal, rayDir), 0.0, 1.0);
+        float grazing = 1.0 - nd;
+
+        float slopeScaled = max(bias * 0.5, footprint * 0.02);
+        float dirOffset = slopeScaled * (0.15 + 1.5 * grazing * grazing);
+        vec3 rayOrigin = origin + rayDir * dirOffset;
+
+        // Make tMin stricter only for grazing rays to suppress self-intersections without increasing global bias.
+        // Up to 2% of radius when grazing=1 (almost tangent).
+        float tMinRay = tMin;
+        tMinRay = max(tMinRay, dirOffset * 2.5);
+        tMinRay = max(tMinRay, radius * 0.03 * grazing * grazing);
+
+        visibility += traceAoRay(rayOrigin, rayDir, tMinRay, radius);
+    }
+    float current = visibility / float(rayCount);
+
+    if (debugMode == 12u) {
+        imageStore(rtaoHistoryCurrOut, pix, vec4(clamp(current, 0.0, 1.0), 0.0, 0.0, 0.0));
+        return;
+    }
+
+    vec2 halfUv = (vec2(pix) + 0.5) / vec2(pc.width, pc.height);
+    vec2 prevUv = halfUv;
+    bool hasPrev = computePrevUv(worldPos, prevUv);
+    float history = texture(rtaoHistoryPrev, hasPrev ? prevUv : halfUv).r;
+    float prevViewZ = texture(linearDepthResolve, hasPrev ? prevUv : halfUv).r;
+    if (prevViewZ <= 1e-6) {
+        prevViewZ = viewZ;
+    }
+    // Use linear(view-space) depth difference for temporal rejection.
+    float depthDiff = abs(prevViewZ - viewZ) / max(viewZ, 1e-3);
+    float temporalAlpha = clamp(ubo.rtaoParams1.y, 0.0, 0.99);
+    // Make disocclusion threshold noise-aware so 1-ray AO can actually accumulate temporally.
+    float baseThreshold = max(ubo.rtaoParams1.z, 0.0);
+    float noiseTerm = 0.6 / sqrt(float(rayCount));  // rayCount=1 -> +0.6, rayCount=4 -> +0.3
+    float disocclusionThreshold = clamp(baseThreshold + noiseTerm, 0.0, 1.5);
+
+    // Noise-aware clamp (Bernoulli variance of visibility) to reduce ghosting/trailing.
+    float variance = max(current * (1.0 - current), 0.0) / float(rayCount);
+    float sigma = sqrt(variance);
+    float clampK = 2.5;
+    float historyClamped = clamp(history, current - clampK * sigma, current + clampK * sigma);
+
+    float delta = abs(current - historyClamped);
+    float rejectDelta = smoothstep(disocclusionThreshold, disocclusionThreshold * 2.0 + 1e-5, delta);
+    // This compares current-frame depth at prevUv (we don't have previous depth buffer),
+    // so keep it conservative to avoid over-rejecting history at distance.
+    float rejectDepth = smoothstep(0.02, 0.15, depthDiff);
+    float reject = max(rejectDelta, rejectDepth);
+    float historyWeight = (ubo.rtaoParams1.w < 0.5) ? 0.0 : (temporalAlpha * (1.0 - reject));
+    float accum = mix(current, historyClamped, historyWeight);
+
+    imageStore(rtaoHistoryCurrOut, pix, vec4(accum, 0.0, 0.0, 0.0));
+}
+
