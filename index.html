@@ -211,7 +211,7 @@
         <div class="brand">
           <h1 class="title">VulkanLearning</h1>
           <p class="subtitle">
-            一个以学习为目标的 Vulkan 渲染器：<b>间接绘制</b>、轻量 <b>Rendergraph</b>、<b>RayQuery</b> 软阴影、<b>RTAO</b>（compute + 去噪）与
+            一个以学习为目标的 Vulkan 渲染器，实现内容：<b>glTF 与 KTX2 加载器</b>、<b>资源统一管理</b>，支持<b>间接绘制与动态渲染</b>、轻量 <b>Rendergraph</b>、<b>RayQuery</b> 软阴影、<b>RTAO</b>（compute + 去噪）与
             <b>IBL</b> 运行时预计算。
           </p>
         </div>
@@ -258,7 +258,7 @@
               <div class="kv">
                 <b>RTAO（RayQuery + Compute）</b>
                 <div class="small">
-                  Compute 中用 <code>rayQueryEXT</code> 追踪 AO 射线并做 temporal 累积；可选 A-Trous 双边滤波（深度/法线 edge-stopping）去噪；最终写入
+                  Compute 中用 <code>rayQueryEXT</code> 追踪 AO 射线并做 temporal 累积；使用A-Trous 双边滤波（深度/法线 edge-stopping）去噪；最终写入
                   <code>rtao_full</code> 供 PBR 采样。
                 </div>
               </div>
@@ -288,14 +288,73 @@
         </aside>
       </div>
 
+      <section class="card" style="margin-top: 14px" aria-label="runtime-loading">
+        <div class="hd"><h2>程序端：模型/纹理/资源加载（贴近当前实现）</h2></div>
+        <div class="bd">
+          <div class="kvs">
+            <div class="kv">
+              <b>统一资源管理（ResourceManager / ResourceHandle）</b>
+              <div class="small">
+                资源都继承自 <code>Resource</code>（<code>doLoad()</code>/<code>doUnload()</code>），通过
+                <code>ResourceManager::Load&lt;T&gt;(resourceId)</code> 统一加载并做类型分桶存储；返回的
+                <code>ResourceHandle&lt;T&gt;</code> 负责引用计数（拷贝 +1，析构 -1），当 refcount 归零时触发
+                <code>Unload()</code> 并从资源表移除。需要“一键清场”时走 <code>UnloadAll()</code>。
+              </div>
+              <div class="mono" style="margin-top: 8px">
+                相关代码：<code>app/include/Resource/core/ResourceManager.h</code> ·
+                <code>app/include/Resource/core/ResourceHandle.h</code> ·
+                <code>app/include/Resource/core/Resource.h</code>
+              </div>
+            </div>
+
+            <div class="kv">
+              <b>模型加载（Model + GltfModelLoader）</b>
+              <div class="small">
+                <code>Model::doLoad()</code> 会在 <code>AppConfig::ASSETS_PATH + "models/"</code> 下按优先级尝试
+                <code>.gltf</code> → <code>.glb</code> → <code>.obj</code>；加载成功后会重建节点线性列表并计算包围盒（用于剔除/加速结构等）。
+                例如：<code>resourceId = "bistro/bistro"</code> 对应 <code>assets/models/bistro/bistro.gltf</code>。
+              </div>
+              <div class="mono" style="margin-top: 8px">
+                相关代码：<code>app/src/Resource/model/Model.cpp</code> · <code>app/src/Resource/model/loaders/GltfModelLoader.cpp</code>
+              </div>
+            </div>
+
+            <div class="kv">
+              <b>纹理加载（KTX2：转码 + 上传；PNG：stb_image）</b>
+              <div class="small">
+                <code>KtxTextureLoader</code> 支持从文件或内存加载（适配 glTF 内嵌纹理），并按 GPU 特性选择最优转码格式（优先 BC7 / ASTC / ETC2，兜底 RGBA32），随后用 staging
+                buffer 上传到设备本地 image，完成 layout 切换到 <code>ShaderReadOnlyOptimal</code>；必要时按场景创建 sampler（天空盒 clamp-to-edge、经纬度 HDR 的 U repeat / V clamp 等）。
+                同时保留了 <code>Texture</code>（PNG + mipmap 生成）这条更直观的学习路径。
+              </div>
+              <div class="mono" style="margin-top: 8px">
+                相关代码：<code>app/src/Resource/texture/KtxTextureLoader.cpp</code> · <code>app/src/Resource/texture/Texture.cpp</code> ·
+                纹理转换脚本：<code>scripts/convert_textures_to_ktx2.bat</code>
+              </div>
+            </div>
+
+            <div class="kv">
+              <b>资源生命周期（GPU 句柄释放顺序）</b>
+              <div class="small">
+                资源的 GPU 句柄使用 <code>vk::raii::*</code> 与 <code>std::optional</code> 持有，<code>doUnload()</code> 中按“先依赖者后被依赖者”的顺序
+                reset（例如 <code>Sampler</code> → <code>ImageView</code> → <code>Image</code> → <code>Memory</code>），与 Vulkan 资源销毁依赖关系保持一致。
+              </div>
+            </div>
+          </div>
+
+          <p class="small" style="margin-top: 10px">
+            这部分内容写的是“程序端怎么把资产变成 GPU 可用资源”的链路；渲染侧如何把它们组织进 Rendergraph、如何做同步/布局切换与 pass 调度，请看下方“渲染管线概览”。
+          </p>
+        </div>
+      </section>
+
       <section class="card" style="margin-top: 14px" aria-label="architecture">
         <div class="hd"><h2>渲染管线概览</h2></div>
         <div class="bd">
           <div class="mono">
             Renderer::init() 组装 Rendergraph passes：
             <br />
-            <code>SkyboxPass (可选)</code> → <code>DepthPrepass</code> → <code>RtaoComputePass</code> → <code>ForwardPass</code> → <code>Bloom*</code> →
-            <code>TonemapBloomPass</code> → <code>ImGui (可选)</code>
+            <code>SkyboxPass</code> → <code>DepthNormalPrepass</code> → <code>RtaoComputePass</code> → <code>ForwardPass</code> → <code>Bloom*</code> →
+            <code>TonemapBloomPass</code> → <code>ImGui</code>
           </div>
           <p class="small" style="margin-top: 10px">
             Pages 只是展示页面；详细的架构/算法/参数与局限请查看仓库根目录 <code>README.md</code> 与 <code>docs/</code>。
