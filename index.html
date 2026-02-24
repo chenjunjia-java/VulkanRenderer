@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>VulkanLearning - Vulkan Renderer Demo</title>
+    <meta
+      name="description"
+      content="VulkanLearning：Vulkan 渲染器项目展示页（间接绘制 / Rendergraph / RayQuery 软阴影 / RTAO / IBL）。"
+    />
+    <style>
+      :root {
+        --bg: #0b1020;
+        --card: rgba(255, 255, 255, 0.06);
+        --card2: rgba(255, 255, 255, 0.09);
+        --text: rgba(255, 255, 255, 0.92);
+        --muted: rgba(255, 255, 255, 0.72);
+        --faint: rgba(255, 255, 255, 0.55);
+        --border: rgba(255, 255, 255, 0.12);
+        --accent: #8ab4ff;
+        --accent2: #55d6be;
+        --warning: #ffd479;
+        --shadow: rgba(0, 0, 0, 0.35);
+        --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+          "Segoe UI Emoji";
+      }
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg: #f6f7fb;
+          --card: rgba(0, 0, 0, 0.04);
+          --card2: rgba(0, 0, 0, 0.06);
+          --text: rgba(0, 0, 0, 0.88);
+          --muted: rgba(0, 0, 0, 0.68);
+          --faint: rgba(0, 0, 0, 0.52);
+          --border: rgba(0, 0, 0, 0.10);
+          --shadow: rgba(0, 0, 0, 0.10);
+        }
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        font-family: var(--sans);
+        color: var(--text);
+        background: radial-gradient(1200px 700px at 20% -10%, rgba(138, 180, 255, 0.28), transparent 55%),
+          radial-gradient(1000px 600px at 95% 10%, rgba(85, 214, 190, 0.22), transparent 55%),
+          linear-gradient(180deg, var(--bg), var(--bg));
+      }
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+      a:hover {
+        text-decoration: underline;
+      }
+      .wrap {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 28px 18px 48px;
+      }
+      header {
+        display: flex;
+        gap: 16px;
+        align-items: flex-start;
+        justify-content: space-between;
+        margin-bottom: 18px;
+      }
+      .brand {
+        display: grid;
+        gap: 6px;
+      }
+      .title {
+        font-size: clamp(22px, 3.1vw, 34px);
+        font-weight: 750;
+        letter-spacing: 0.2px;
+        margin: 0;
+        line-height: 1.12;
+      }
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.35;
+      }
+      .pillbar {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+        justify-content: flex-end;
+        padding-top: 6px;
+      }
+      .pill {
+        border: 1px solid var(--border);
+        background: var(--card);
+        padding: 8px 10px;
+        border-radius: 999px;
+        font-size: 12px;
+        color: var(--muted);
+        box-shadow: 0 10px 30px var(--shadow);
+        backdrop-filter: blur(8px);
+      }
+      .grid {
+        display: grid;
+        gap: 14px;
+      }
+      @media (min-width: 920px) {
+        .grid {
+          grid-template-columns: 1.2fr 0.8fr;
+          align-items: start;
+        }
+      }
+      .card {
+        border: 1px solid var(--border);
+        background: linear-gradient(180deg, var(--card), var(--card2));
+        border-radius: 14px;
+        box-shadow: 0 18px 60px var(--shadow);
+        backdrop-filter: blur(10px);
+        overflow: hidden;
+      }
+      .card .hd {
+        padding: 14px 16px 0;
+      }
+      .card h2 {
+        margin: 0;
+        font-size: 15px;
+        letter-spacing: 0.2px;
+      }
+      .card .bd {
+        padding: 12px 16px 16px;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+      .videoWrap {
+        padding: 0;
+      }
+      video {
+        display: block;
+        width: 100%;
+        height: auto;
+        background: rgba(0, 0, 0, 0.28);
+      }
+      .note {
+        border-left: 3px solid var(--warning);
+        padding: 10px 12px;
+        margin: 12px 0 0;
+        border-radius: 10px;
+        background: rgba(255, 212, 121, 0.10);
+        color: var(--muted);
+      }
+      ul {
+        margin: 10px 0 0;
+        padding-left: 18px;
+      }
+      li {
+        margin: 6px 0;
+      }
+      code,
+      pre {
+        font-family: var(--mono);
+      }
+      details {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        background: rgba(0, 0, 0, 0.08);
+      }
+      summary {
+        cursor: pointer;
+        color: var(--text);
+        font-weight: 650;
+      }
+      .kvs {
+        display: grid;
+        gap: 10px;
+      }
+      .kv {
+        padding: 10px 12px;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        background: rgba(0, 0, 0, 0.06);
+      }
+      .kv b {
+        color: var(--text);
+      }
+      footer {
+        margin-top: 18px;
+        color: var(--faint);
+        font-size: 12px;
+      }
+      .small {
+        font-size: 12.5px;
+        color: var(--muted);
+      }
+      .mono {
+        font-family: var(--mono);
+        font-size: 12px;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="brand">
+          <h1 class="title">VulkanLearning</h1>
+          <p class="subtitle">
+            一个以学习为目标的 Vulkan 渲染器：<b>间接绘制</b>、轻量 <b>Rendergraph</b>、<b>RayQuery</b> 软阴影、<b>RTAO</b>（compute + 去噪）与
+            <b>IBL</b> 运行时预计算。
+          </p>
+        </div>
+        <div class="pillbar" aria-label="highlights">
+          <span class="pill">Vulkan 1.2 + Dynamic Rendering</span>
+          <span class="pill">Multi-Draw Indirect</span>
+          <span class="pill">VK_KHR_ray_query</span>
+          <span class="pill">ImGui 运行时调试</span>
+        </div>
+      </header>
+
+      <div class="grid">
+        <section class="card videoWrap" aria-label="demo video">
+          <video controls preload="metadata" playsinline>
+            <source src="videos/2026-02-24-15-20-17.mp4" type="video/mp4" />
+            你的浏览器不支持 HTML5 video。你可以直接下载视频文件：
+            <a href="videos/2026-02-24-15-20-17.mp4">videos/2026-02-24-15-20-17.mp4</a>
+          </video>
+          <div class="bd">
+            <div class="mono">视频路径：<code>videos/2026-02-24-15-20-17.mp4</code></div>
+            <div class="note small">
+              如果你在 GitHub Pages 上看不到视频，通常是因为仓库里视频文件过大、网络较慢，或浏览器策略导致未自动加载。建议先点播放（会触发加载），或用上方链接直接下载。
+            </div>
+          </div>
+        </section>
+
+        <aside class="card" aria-label="feature summary">
+          <div class="hd"><h2>当前实现要点（摘自代码）</h2></div>
+          <div class="bd">
+            <div class="kvs">
+              <div class="kv">
+                <b>间接绘制（Multi-Draw Indirect）</b>
+                <div class="small">
+                  合并全局 VB/IB（<code>GlobalMeshBuffer</code>），每帧构建 <code>vk::DrawIndexedIndirectCommand</code>，按材质桶批量
+                  <code>vkCmdDrawIndexedIndirect</code> 下发；顶点着色器用 <code>gl_BaseInstance</code> 索引 per-draw <code>DrawData</code>。
+                </div>
+              </div>
+              <div class="kv">
+                <b>Rendergraph（渲染图）</b>
+                <div class="small">
+                  Pass 输入/输出构图 → 拓扑排序执行；执行前为资源切换到 pass 需要的 layout，执行后对 external（swapchain）恢复到 present layout。
+                </div>
+              </div>
+              <div class="kv">
+                <b>RTAO（RayQuery + Compute）</b>
+                <div class="small">
+                  Compute 中用 <code>rayQueryEXT</code> 追踪 AO 射线并做 temporal 累积；可选 A-Trous 双边滤波（深度/法线 edge-stopping）去噪；最终写入
+                  <code>rtao_full</code> 供 PBR 采样。
+                </div>
+              </div>
+              <div class="kv">
+                <b>软阴影</b>
+                <div class="small">
+                  方向光通过“太阳盘面多射线采样”实现软阴影（泊松盘采样），点光源用单射线 ray query 做可见性测试。
+                </div>
+              </div>
+              <div class="kv">
+                <b>IBL 运行时预计算</b>
+                <div class="small">
+                  启动时从 HDR 等距柱状贴图生成 env cubemap，并预计算 irradiance / GGX prefilter / BRDF LUT，运行时在 PBR 中采样。
+                </div>
+              </div>
+            </div>
+
+            <details style="margin-top: 12px">
+              <summary>局限与待解决问题（已记录在文档/现象）</summary>
+              <ul>
+                <li><b>CPU 瓶颈</b>：帧内大量 command buffer 录制与 draw 下发；现阶段 <code>record</code> 可能占到主要时间（你提到约 70%）。</li>
+                <li><b>TLAS/查询同步开销</b>：静态场景下 TLAS 更新与 Occlusion Query 回读会放大 CPU 阻塞（详见 <code>docs/CPU_PERFORMANCE_ANALYSIS.md</code>）。</li>
+                <li><b>远处贴图闪烁/锯齿</b>：通常与 mip/各向异性、alpha-mask 边缘、缺少 TAA 等相关；当前已有部分稳定性处理（例如 normal/specular AA、MSAA 采样策略）。</li>
+              </ul>
+            </details>
+          </div>
+        </aside>
+      </div>
+
+      <section class="card" style="margin-top: 14px" aria-label="architecture">
+        <div class="hd"><h2>渲染管线概览</h2></div>
+        <div class="bd">
+          <div class="mono">
+            Renderer::init() 组装 Rendergraph passes：
+            <br />
+            <code>SkyboxPass (可选)</code> → <code>DepthPrepass</code> → <code>RtaoComputePass</code> → <code>ForwardPass</code> → <code>Bloom*</code> →
+            <code>TonemapBloomPass</code> → <code>ImGui (可选)</code>
+          </div>
+          <p class="small" style="margin-top: 10px">
+            Pages 只是展示页面；详细的架构/算法/参数与局限请查看仓库根目录 <code>README.md</code> 与 <code>docs/</code>。
+          </p>
+        </div>
+      </section>
+
+      <footer>
+        <div>© VulkanLearning · GitHub Pages</div>
+      </footer>
+    </div>
+  </body>
+</html>
