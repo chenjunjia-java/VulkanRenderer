@@ -279,7 +279,7 @@
             <details style="margin-top: 12px">
               <summary>局限与待解决问题（已记录在文档/现象）</summary>
               <ul>
-                <li><b>CPU 瓶颈</b>：帧内大量 command buffer 录制与 draw 下发；现阶段 <code>record</code> 可能占到主要时间（你提到约 70%）。</li>
+                <li><b>CPU 瓶颈</b>：帧内大量 command buffer 录制与 draw 下发；现阶段 <code>record</code> 占据到主要时间（约 70%）。</li>
                 <li><b>TLAS/查询同步开销</b>：静态场景下 TLAS 更新与 Occlusion Query 回读会放大 CPU 阻塞（详见 <code>docs/CPU_PERFORMANCE_ANALYSIS.md</code>）。</li>
                 <li><b>远处贴图闪烁/锯齿</b>：通常与 mip/各向异性、alpha-mask 边缘、缺少 TAA 等相关；当前已有部分稳定性处理（例如 normal/specular AA、MSAA 采样策略）。</li>
               </ul>
@@ -289,7 +289,7 @@
       </div>
 
       <section class="card" style="margin-top: 14px" aria-label="runtime-loading">
-        <div class="hd"><h2>程序端：模型/纹理/资源加载（贴近当前实现）</h2></div>
+        <div class="hd"><h2>程序端：模型/纹理/资源加载</h2></div>
         <div class="bd">
           <div class="kvs">
             <div class="kv">
@@ -320,11 +320,10 @@
             </div>
 
             <div class="kv">
-              <b>纹理加载（KTX2：转码 + 上传；PNG：stb_image）</b>
+              <b>纹理加载（KTX2：转码 + 上传）</b>
               <div class="small">
                 <code>KtxTextureLoader</code> 支持从文件或内存加载（适配 glTF 内嵌纹理），并按 GPU 特性选择最优转码格式（优先 BC7 / ASTC / ETC2，兜底 RGBA32），随后用 staging
-                buffer 上传到设备本地 image，完成 layout 切换到 <code>ShaderReadOnlyOptimal</code>；必要时按场景创建 sampler（天空盒 clamp-to-edge、经纬度 HDR 的 U repeat / V clamp 等）。
-                同时保留了 <code>Texture</code>（PNG + mipmap 生成）这条更直观的学习路径。
+                buffer 上传到设备本地 image，完成 layout 切换到 <code>ShaderReadOnlyOptimal</code>。
               </div>
               <div class="mono" style="margin-top: 8px">
                 相关代码：<code>app/src/Resource/texture/KtxTextureLoader.cpp</code> · <code>app/src/Resource/texture/Texture.cpp</code> ·
@@ -340,10 +339,6 @@
               </div>
             </div>
           </div>
-
-          <p class="small" style="margin-top: 10px">
-            这部分内容写的是“程序端怎么把资产变成 GPU 可用资源”的链路；渲染侧如何把它们组织进 Rendergraph、如何做同步/布局切换与 pass 调度，请看下方“渲染管线概览”。
-          </p>
         </div>
       </section>
 
